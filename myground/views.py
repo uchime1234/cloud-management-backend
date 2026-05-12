@@ -185,65 +185,93 @@ def verify_and_register(username, email, password, verification_code):
 
 @api_view(['POST'])
 def login_user(request):
-    # Add debug logging
+    """
+    Login user with username or email, supports MFA
+    """
+    # Debug logging
     print("=" * 60)
     print("🔍 LOGIN ATTEMPT RECEIVED")
     print(f"Request method: {request.method}")
     print(f"Request content type: {request.content_type}")
     print(f"Request data: {request.data}")
-    print(f"Request body: {request.body}")
     print("=" * 60)
     
-    username = request.data.get('username')
+    # Get credentials
+    username_or_email = request.data.get('username')
     password = request.data.get('password')
-    mfa_code = request.data.get('mfa_code')  # Optional for MFA
+    mfa_code = request.data.get('mfa_code')
     
-    print(f"Extracted - username: {username}, password: {'*' * len(password) if password else 'None'}, mfa_code: {mfa_code}")
+    print(f"Login attempt for: {username_or_email}")
     
-    if not username or not password:
-        print("❌ Missing username or password")
-        return Response({"error": "Username and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+    # Validate required fields
+    if not username_or_email or not password:
+        print("❌ Missing username/email or password")
+        return Response(
+            {"error": "Username/email and password are required"}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
     
-    user = auth.authenticate(username=username, password=password)
+    # Authenticate with username or email
+    user = None
     
-    if user is not None:
-        print(f"✅ User authenticated: {user.username}")
-        # Check if MFA is enabled
+    if '@' in username_or_email:
+        # Try email authentication
+        try:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            user_obj = User.objects.get(email=username_or_email)
+            user = authenticate(username=user_obj.username, password=password)
+            print(f"📧 Email login attempt for: {username_or_email} -> {user_obj.username}")
+        except User.DoesNotExist:
+            print(f"❌ No user found with email: {username_or_email}")
+    else:
+        # Try username authentication
+        user = authenticate(username=username_or_email, password=password)
+        print(f"👤 Username login attempt for: {username_or_email}")
+    
+    # Process authenticated user
+    if user:
+        print(f"✅ Authentication successful for: {user.username}")
+        
+        # Check MFA
         try:
             mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
+            print(f"🔐 MFA is enabled for {user.username}")
             
             if not mfa_code:
-                # MFA is enabled but no code provided
-                print("🔐 MFA required but no code provided")
+                print("🔐 MFA code required")
                 return Response({
                     "mfa_required": True,
                     "user_id": user.id,
                     "message": "MFA code required"
                 }, status=status.HTTP_200_OK)
             
-            # Verify MFA code
             if not verify_totp_code(mfa_config.secret_key, mfa_code):
                 print("❌ Invalid MFA code")
-                return Response({
-                    "error": "Invalid MFA code"
-                }, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": "Invalid MFA code"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            print("✅ MFA code verified")
                 
         except MFAConfiguration.DoesNotExist:
-            pass  # MFA not enabled
+            print("🔓 No MFA enabled for this user")
         
-        # Create token and return success
+        # Generate token
         token, _ = Token.objects.get_or_create(user=user)
-        print(f"✅ Login successful, token created for {user.username}")
+        
         return Response({
-            "token": token.key,  
-            "message": 'Login successful',
+            "token": token.key,
+            "message": "Login successful",
             "user_id": user.id,
             "username": user.username,
             "email": user.email
         }, status=status.HTTP_200_OK)
+    
     else:
-        print(f"❌ Authentication failed for username: {username}")
-        return Response({"error": 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+        print(f"❌ Authentication failed for: {username_or_email}")
+        return Response(
+            {"error": "Invalid credentials"}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
 # ============================================================
 # TOKEN-BASED MFA ENDPOINTS (for post-registration setup)
 # ============================================================
