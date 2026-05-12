@@ -67,13 +67,35 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "https://cloud-management-frontend.vercel.app",
-    "https://your-backend-name.onrender.com",
+    
 ]
 
 # If you want to allow all origins for development (temporary fix)
 CORS_ALLOW_ALL_ORIGINS = True
 
 ROOT_URLCONF = 'authhentication.urls'
+
+# Add these CORS settings
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
 
 TEMPLATES = [
     {

@@ -181,23 +181,40 @@ def verify_and_register(username, email, password, verification_code):
         return Response({"error": f"Failed to create user: {str(e)}"}, 
                        status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# myground/views.py - Update your login_user function
 
-# myground/views.py (update login_user function)
 @api_view(['POST'])
 def login_user(request):
+    # Add debug logging
+    print("=" * 60)
+    print("🔍 LOGIN ATTEMPT RECEIVED")
+    print(f"Request method: {request.method}")
+    print(f"Request content type: {request.content_type}")
+    print(f"Request data: {request.data}")
+    print(f"Request body: {request.body}")
+    print("=" * 60)
+    
     username = request.data.get('username')
     password = request.data.get('password')
     mfa_code = request.data.get('mfa_code')  # Optional for MFA
     
+    print(f"Extracted - username: {username}, password: {'*' * len(password) if password else 'None'}, mfa_code: {mfa_code}")
+    
+    if not username or not password:
+        print("❌ Missing username or password")
+        return Response({"error": "Username and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+    
     user = auth.authenticate(username=username, password=password)
     
     if user is not None:
+        print(f"✅ User authenticated: {user.username}")
         # Check if MFA is enabled
         try:
             mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
             
             if not mfa_code:
                 # MFA is enabled but no code provided
+                print("🔐 MFA required but no code provided")
                 return Response({
                     "mfa_required": True,
                     "user_id": user.id,
@@ -206,6 +223,7 @@ def login_user(request):
             
             # Verify MFA code
             if not verify_totp_code(mfa_config.secret_key, mfa_code):
+                print("❌ Invalid MFA code")
                 return Response({
                     "error": "Invalid MFA code"
                 }, status=status.HTTP_400_BAD_REQUEST)
@@ -215,6 +233,7 @@ def login_user(request):
         
         # Create token and return success
         token, _ = Token.objects.get_or_create(user=user)
+        print(f"✅ Login successful, token created for {user.username}")
         return Response({
             "token": token.key,  
             "message": 'Login successful',
@@ -223,9 +242,8 @@ def login_user(request):
             "email": user.email
         }, status=status.HTTP_200_OK)
     else:
-        return Response({"error":'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
-
-
+        print(f"❌ Authentication failed for username: {username}")
+        return Response({"error": 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
 # ============================================================
 # TOKEN-BASED MFA ENDPOINTS (for post-registration setup)
 # ============================================================
