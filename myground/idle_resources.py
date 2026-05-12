@@ -2365,6 +2365,9 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
+# idle_resources_db.py - Update the get_cached_idle_results function
+
+
 
 def get_cached_idle_results(user, aws_account, force_refresh=False):
     """
@@ -2378,10 +2381,15 @@ def get_cached_idle_results(user, aws_account, force_refresh=False):
         IdleCloudWatchAlarm, IdleCloudWatchDashboard, IdleCloudWatchMetric
     )
     
+    # If force_refresh is True, return None to force a fresh scan
+    if force_refresh:
+        print("🔄 Force refresh requested - skipping cache")
+        return None
+    
     # Check if we have cached results
     cached_ec2 = IdleEC2Instance.objects.filter(aws_account=aws_account, is_resolved=False)
     
-    if not force_refresh and cached_ec2.exists():
+    if cached_ec2.exists():
         logger.info(f"📦 Using cached idle resources: {cached_ec2.count()} EC2 instances")
         
         # Build response from cached data
@@ -2402,7 +2410,6 @@ def get_cached_idle_results(user, aws_account, force_refresh=False):
         }
     
     return None
-
 
 def _count_total_findings(aws_account):
     """Helper to count total findings"""
