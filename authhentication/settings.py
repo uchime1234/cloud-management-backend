@@ -18,6 +18,7 @@ ALLOWED_HOSTS = [
     ".onrender.com",
     "localhost",
     "127.0.0.1",
+    "https://cloud-management-frontend.vercel.app/"
 ]
 
 INSTALLED_APPS = [
@@ -56,7 +57,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://your-frontend-name.vercel.app",
+    "https://cloud-management-frontend.vercel.app"
     
 ]
 
@@ -65,7 +66,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
-    "https://your-frontend-name.vercel.app",
+    "https://cloud-management-frontend.vercel.app"
     "https://your-backend-name.onrender.com",
 ]
 
