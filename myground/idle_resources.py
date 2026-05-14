@@ -2713,7 +2713,6 @@ def _get_cached_cloudwatch_resources(aws_account):
         }
     }
 
-
 def clear_all_idle_data(aws_account):
     """
     Clear all idle resources data from database
