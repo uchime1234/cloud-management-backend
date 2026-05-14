@@ -790,13 +790,19 @@ def assume_role_for_account(aws_account):
     )
     return response["Credentials"]
 
+# storage_optimization_service.py - Fix the get_cached_storage_results function
 
 def get_cached_storage_results(user, aws_account, force_refresh=False):
     """
     Get cached storage results from database
     Only makes AWS API calls if force_refresh=True or no cache exists
     """
-    from .models import StorageOptimizationFinding, DuplicateStorageFinding, ResourceUsageSnapshot
+    from .models import StorageOptimizationFinding, DuplicateStorageFinding, ResourceUsageSnapshot, StorageOptimizationSummary
+    
+    # If force_refresh is True, return None to force a fresh scan
+    if force_refresh:
+        print("🔄 Force refresh requested - skipping storage cache")
+        return None
     
     # Check if we have cached results (any age - we keep them until deleted)
     cached_findings = StorageOptimizationFinding.objects.filter(
@@ -804,12 +810,32 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
         status='active'
     )
     
-    # If force_refresh is False and we have cached data, return it
-    if not force_refresh and cached_findings.exists():
+    if cached_findings.exists():
         logger.info(f"📦 Using cached storage findings: {cached_findings.count()} items")
         
         # Get summary from database
         summary = StorageOptimizationSummary.objects.filter(aws_account=aws_account).first()
+        
+        # Get snapshots
+        ebs_snapshot = ResourceUsageSnapshot.objects.filter(
+            aws_account=aws_account,
+            service_name='ebs'
+        ).order_by('-snapshot_date').first()
+        
+        elastic_ip_snapshot = ResourceUsageSnapshot.objects.filter(
+            aws_account=aws_account,
+            service_name='elastic_ips'
+        ).order_by('-snapshot_date').first()
+        
+        rds_snapshot = ResourceUsageSnapshot.objects.filter(
+            aws_account=aws_account,
+            service_name='rds'
+        ).order_by('-snapshot_date').first()
+        
+        snapshots_snapshot = ResourceUsageSnapshot.objects.filter(
+            aws_account=aws_account,
+            service_name='snapshots'
+        ).order_by('-snapshot_date').first()
         
         # Build response from cached data
         return {
@@ -818,11 +844,7 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
             'total_findings': cached_findings.count(),
             'total_potential_savings': float(summary.total_estimated_waste) if summary else 0,
             'ebs_volumes': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='ebs',
-                    snapshot_date=timezone.now().date()
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='ebs').exists() else 0,
+                'total': ebs_snapshot.usage_value if ebs_snapshot else 0,
                 'unattached': cached_findings.filter(resource_type='ebs_volume').count(),
                 'unattached_volumes': [
                     {
@@ -830,46 +852,37 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
                         'size_gb': float(f.size_gb) if f.size_gb else 0,
                         'monthly_cost': float(f.estimated_monthly_cost),
                         'region': f.region,
-                        'volume_type': f.metadata.get('volume_type', 'gp2')
+                        'volume_type': f.metadata.get('volume_type', 'gp2') if f.metadata else 'gp2'
                     }
                     for f in cached_findings.filter(resource_type='ebs_volume')
                 ],
                 'items': []
             },
             'elastic_ips': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='elastic_ips'
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='elastic_ips').exists() else 0,
+                'total': elastic_ip_snapshot.usage_value if elastic_ip_snapshot else 0,
                 'unused': cached_findings.filter(resource_type='elastic_ip').count(),
                 'items': [
                     {
                         'public_ip': f.resource_id,
-                        'allocation_id': f.metadata.get('allocation_id', ''),
-                        'domain': f.metadata.get('domain', ''),
+                        'allocation_id': f.metadata.get('allocation_id', '') if f.metadata else '',
+                        'domain': f.metadata.get('domain', '') if f.metadata else '',
                         'is_associated': False
                     }
                     for f in cached_findings.filter(resource_type='elastic_ip')
                 ]
             },
             'rds_instances': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='rds'
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='rds').exists() else 0,
+                'total': rds_snapshot.usage_value if rds_snapshot else 0,
                 'items': []
             },
             'snapshots': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='snapshots'
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='snapshots').exists() else 0,
+                'total': snapshots_snapshot.usage_value if snapshots_snapshot else 0,
                 'old': cached_findings.filter(resource_type='ebs_snapshot').count(),
                 'items': [
                     {
                         'snapshot_id': f.resource_id,
                         'volume_size': float(f.size_gb) if f.size_gb else 0,
-                        'age_days': f.metadata.get('age_days', 0),
+                        'age_days': f.metadata.get('age_days', 0) if f.metadata else 0,
                         'monthly_cost': float(f.estimated_monthly_cost)
                     }
                     for f in cached_findings.filter(resource_type='ebs_snapshot')
@@ -880,9 +893,9 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
                 'items': [
                     {
                         'instance_id': f.resource_id,
-                        'instance_class': f.metadata.get('instance_class', 'unknown'),
-                        'avg_cpu': f.metadata.get('avg_cpu', 0),
-                        'storage_gb': f.metadata.get('storage_gb', 0),
+                        'instance_class': f.metadata.get('instance_class', 'unknown') if f.metadata else 'unknown',
+                        'avg_cpu': f.metadata.get('avg_cpu', 0) if f.metadata else 0,
+                        'storage_gb': f.metadata.get('storage_gb', 0) if f.metadata else 0,
                         'monthly_cost': float(f.estimated_monthly_cost)
                     }
                     for f in cached_findings.filter(resource_type='rds_instance')
@@ -894,7 +907,7 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
                     {
                         'ami_id': f.resource_id,
                         'name': f.resource_name,
-                        'age_days': f.metadata.get('age_days', 0),
+                        'age_days': f.metadata.get('age_days', 0) if f.metadata else 0,
                         'volume_size_gb': float(f.size_gb) if f.size_gb else 0,
                         'monthly_cost': float(f.estimated_monthly_cost)
                     }
@@ -918,6 +931,7 @@ def get_cached_storage_results(user, aws_account, force_refresh=False):
     
     return None
 
+# storage_optimization_service.py - Add this function if not present
 
 def clear_all_storage_data(aws_account):
     """
@@ -942,6 +956,7 @@ def clear_all_storage_data(aws_account):
             'total_deleted': findings_count + duplicates_count + snapshots_count + summary_count
         }
 
+# storage_optimization_service.py - Make sure this function is complete
 
 def save_scan_results_to_db(user, aws_account, scan_results):
     """Save all scan results to database (overwrites existing)"""
@@ -971,7 +986,7 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                 estimated_monthly_cost=vol.get('monthly_cost', 0),
                 confidence_score=95,
                 reason="This EBS volume is not attached to any EC2 instance, meaning it's not being used but still incurring storage costs.",
-                recommendation=f"Delete this unattached volume to save ${vol.get('monthly_cost', 0)}/month. First verify you don't need the data, then you can delete it from the EC2 console.",
+                recommendation=f"Delete this unattached volume to save ${vol.get('monthly_cost', 0)}/month.",
                 severity='high' if vol.get('monthly_cost', 0) > 50 else 'medium',
                 status='active',
                 metadata={
@@ -994,7 +1009,7 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                     estimated_monthly_cost=3.65,
                     confidence_score=100,
                     reason="This Elastic IP is allocated but not associated with any resource. AWS charges for unattached Elastic IPs.",
-                    recommendation="Release this Elastic IP to stop incurring charges. If you need to keep it, associate it with an EC2 instance or NAT gateway.",
+                    recommendation="Release this Elastic IP to stop incurring charges.",
                     severity='medium',
                     status='active',
                     metadata={
@@ -1014,8 +1029,8 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                 region=aws_account.account_id[:10],
                 estimated_monthly_cost=rds.get('monthly_cost', 0),
                 confidence_score=85,
-                reason=f"This RDS instance has very low CPU utilization ({rds.get('avg_cpu', 0)}% average over 7 days), suggesting it's underutilized.",
-                recommendation=f"Consider downsizing to a smaller instance class or using Aurora Serverless. Potential savings: ${rds.get('monthly_cost', 0)}/month.",
+                reason=f"This RDS instance has very low CPU utilization ({rds.get('avg_cpu', 0)}% average over 7 days).",
+                recommendation=f"Consider downsizing or stopping this instance. Potential savings: ${rds.get('monthly_cost', 0)}/month.",
                 severity='medium' if rds.get('monthly_cost', 0) > 30 else 'low',
                 status='active',
                 metadata={
@@ -1038,8 +1053,8 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                     size_gb=snap.get('volume_size', 0),
                     estimated_monthly_cost=snap.get('monthly_cost', 0),
                     confidence_score=90,
-                    reason=f"This snapshot is {snap.get('age_days', 0)} days old. Keeping very old snapshots wastes storage.",
-                    recommendation=f"Delete this old snapshot to save ${snap.get('monthly_cost', 0)}/month. Keep only the last 2-3 recent snapshots.",
+                    reason=f"This snapshot is {snap.get('age_days', 0)} days old.",
+                    recommendation=f"Delete this old snapshot to save ${snap.get('monthly_cost', 0)}/month.",
                     severity='low',
                     status='active',
                     metadata={
@@ -1060,8 +1075,8 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                 size_gb=ami.get('volume_size_gb', 0),
                 estimated_monthly_cost=ami.get('monthly_cost', 0),
                 confidence_score=90,
-                reason=f"This AMI is {ami.get('age_days', 0)} days old and not used by any running EC2 instance.",
-                recommendation=f"Deregister this unused AMI to save ${ami.get('monthly_cost', 0)}/month in EBS snapshot storage costs.",
+                reason=f"This AMI is {ami.get('age_days', 0)} days old and not used.",
+                recommendation=f"Deregister this unused AMI to save ${ami.get('monthly_cost', 0)}/month.",
                 severity='low',
                 status='active',
                 metadata={
@@ -1081,8 +1096,8 @@ def save_scan_results_to_db(user, aws_account, scan_results):
                 resources=dup.get('redundant_snapshots', []),
                 total_wasted_size_gb=dup.get('total_size_gb', 0),
                 estimated_savings=dup.get('monthly_cost', 0),
-                reason=f"You have {dup.get('total_snapshots', 0)} snapshots for this volume. Keeping more than 2-3 is usually redundant.",
-                recommendation=f"Delete {dup.get('redundant_count', 0)} old snapshots to save ${dup.get('monthly_cost', 0)}/month. Keep only the most recent 2-3 snapshots.",
+                reason=f"You have {dup.get('total_snapshots', 0)} snapshots for this volume.",
+                recommendation=f"Delete {dup.get('redundant_count', 0)} old snapshots to save ${dup.get('monthly_cost', 0)}/month.",
                 status='active'
             )
         

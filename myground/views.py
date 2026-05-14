@@ -4668,12 +4668,14 @@ def scan_all_idle_resources_advanced(request, account_id):
         account = AWSAccount.objects.get(id=account_id, user=request.user, status='connected')
         force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
         
+        print(f"🔍 Idle Resources Scan - force_refresh: {force_refresh}")
+        
         # Check for cached results first (unless force_refresh is true)
         if not force_refresh:
             from .idle_resources import get_cached_idle_results
             cached_results = get_cached_idle_results(request.user, account, force_refresh=False)
             if cached_results:
-                print("📦 Returning cached idle results")
+                print("📦 Returning cached idle results from database")
                 return Response(cached_results, status=200)
         
         # Force refresh - make fresh AWS API calls
@@ -4699,6 +4701,7 @@ def scan_all_idle_resources_advanced(request, account_id):
         )
         
         # Delete ALL old findings (complete refresh)
+        print("🗑️ Deleting old idle resource records...")
         IdleEC2Instance.objects.filter(aws_account=account).delete()
         IdleAutoScalingGroup.objects.filter(aws_account=account).delete()
         IdleLoadBalancer.objects.filter(aws_account=account).delete()
@@ -4962,44 +4965,57 @@ def scan_all_idle_resources_advanced(request, account_id):
                     is_resolved=False
                 )
         
-        # Count findings for response
+        # Return the cached results (which will now include the fresh data)
+        from .idle_resources import get_cached_idle_results
+        fresh_results = get_cached_idle_results(request.user, account, force_refresh=False)
+        
+        if fresh_results:
+            fresh_results['cached'] = False
+            return Response(fresh_results, status=200)
+        
+        # Fallback: Build response manually if cache function fails
+        ec2_instances = IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False)
+        asg_instances = IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False)
+        lb_instances = IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False)
+        lambda_instances = IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False)
+        ecs_instances = IdleECSService.objects.filter(aws_account=account, is_resolved=False)
+        nat_instances = IdleNATGateway.objects.filter(aws_account=account, is_resolved=False)
+        vpce_instances = IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False)
+        api_instances = IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False)
+        log_groups = IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False)
+        alarms = IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False)
+        dashboards = IdleCloudWatchDashboard.objects.filter(aws_account=account, is_resolved=False)
+        metrics = IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False)
+        
         total_findings = (
-            IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleECSService.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleNATGateway.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False).count() +
-            IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False).count()
+            ec2_instances.count() + asg_instances.count() + lb_instances.count() +
+            lambda_instances.count() + ecs_instances.count() + nat_instances.count() +
+            vpce_instances.count() + api_instances.count() + log_groups.count() +
+            alarms.count() + dashboards.count() + metrics.count()
         )
         
         total_savings = (
-            sum(inst.monthly_cost for inst in IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(asg.monthly_cost for asg in IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(lb.monthly_cost for lb in IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(func.monthly_cost for func in IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(service.monthly_cost for service in IdleECSService.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(nat.monthly_cost for nat in IdleNATGateway.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(ep.monthly_cost for ep in IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(api.monthly_cost for api in IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(lg.monthly_cost for lg in IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(alarm.monthly_cost for alarm in IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False)) +
-            sum(metric.monthly_cost for metric in IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False))
+            sum(inst.monthly_cost for inst in ec2_instances) +
+            sum(asg.monthly_cost for asg in asg_instances) +
+            sum(lb.monthly_cost for lb in lb_instances) +
+            sum(func.monthly_cost for func in lambda_instances) +
+            sum(service.monthly_cost for service in ecs_instances) +
+            sum(nat.monthly_cost for nat in nat_instances) +
+            sum(ep.monthly_cost for ep in vpce_instances) +
+            sum(api.monthly_cost for api in api_instances) +
+            sum(lg.monthly_cost for lg in log_groups) +
+            sum(alarm.monthly_cost for alarm in alarms) +
+            sum(metric.monthly_cost for metric in metrics)
         )
         
-        # Build response
         result = {
             'success': True,
             'cached': False,
             'total_findings': total_findings,
             'total_savings': float(total_savings),
             'ec2_instances': {
-                'count': IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(inst.monthly_cost) for inst in IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False)),
+                'count': ec2_instances.count(),
+                'savings': sum(float(inst.monthly_cost) for inst in ec2_instances),
                 'items': [
                     {
                         'instance_id': inst.instance_id,
@@ -5009,12 +5025,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(inst.monthly_cost),
                         'reasons': inst.reasons
                     }
-                    for inst in IdleEC2Instance.objects.filter(aws_account=account, is_resolved=False)
+                    for inst in ec2_instances
                 ]
             },
             'auto_scaling_groups': {
-                'count': IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(asg.monthly_cost) for asg in IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False)),
+                'count': asg_instances.count(),
+                'savings': sum(float(asg.monthly_cost) for asg in asg_instances),
                 'items': [
                     {
                         'asg_name': asg.asg_name,
@@ -5026,12 +5042,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(asg.monthly_cost),
                         'reasons': asg.reasons
                     }
-                    for asg in IdleAutoScalingGroup.objects.filter(aws_account=account, is_resolved=False)
+                    for asg in asg_instances
                 ]
             },
             'load_balancers': {
-                'count': IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(lb.monthly_cost) for lb in IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False)),
+                'count': lb_instances.count(),
+                'savings': sum(float(lb.monthly_cost) for lb in lb_instances),
                 'items': [
                     {
                         'lb_name': lb.lb_name,
@@ -5044,12 +5060,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(lb.monthly_cost),
                         'reasons': lb.reasons
                     }
-                    for lb in IdleLoadBalancer.objects.filter(aws_account=account, is_resolved=False)
+                    for lb in lb_instances
                 ]
             },
             'lambda_functions': {
-                'count': IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(func.monthly_cost) for func in IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False)),
+                'count': lambda_instances.count(),
+                'savings': sum(float(func.monthly_cost) for func in lambda_instances),
                 'items': [
                     {
                         'function_name': func.function_name,
@@ -5061,12 +5077,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(func.monthly_cost),
                         'reasons': func.reasons
                     }
-                    for func in IdleLambdaFunction.objects.filter(aws_account=account, is_resolved=False)
+                    for func in lambda_instances
                 ]
             },
             'ecs_services': {
-                'count': IdleECSService.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(service.monthly_cost) for service in IdleECSService.objects.filter(aws_account=account, is_resolved=False)),
+                'count': ecs_instances.count(),
+                'savings': sum(float(service.monthly_cost) for service in ecs_instances),
                 'items': [
                     {
                         'service_name': service.service_name,
@@ -5080,12 +5096,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(service.monthly_cost),
                         'reasons': service.reasons
                     }
-                    for service in IdleECSService.objects.filter(aws_account=account, is_resolved=False)
+                    for service in ecs_instances
                 ]
             },
             'nat_gateways': {
-                'count': IdleNATGateway.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(nat.monthly_cost) for nat in IdleNATGateway.objects.filter(aws_account=account, is_resolved=False)),
+                'count': nat_instances.count(),
+                'savings': sum(float(nat.monthly_cost) for nat in nat_instances),
                 'items': [
                     {
                         'nat_gateway_id': nat.nat_gateway_id,
@@ -5096,12 +5112,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(nat.monthly_cost),
                         'reasons': nat.reasons
                     }
-                    for nat in IdleNATGateway.objects.filter(aws_account=account, is_resolved=False)
+                    for nat in nat_instances
                 ]
             },
             'vpc_endpoints': {
-                'count': IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(ep.monthly_cost) for ep in IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False)),
+                'count': vpce_instances.count(),
+                'savings': sum(float(ep.monthly_cost) for ep in vpce_instances),
                 'items': [
                     {
                         'endpoint_id': ep.endpoint_id,
@@ -5111,12 +5127,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(ep.monthly_cost),
                         'reasons': ep.reasons
                     }
-                    for ep in IdleVPCEndpoint.objects.filter(aws_account=account, is_resolved=False)
+                    for ep in vpce_instances
                 ]
             },
             'api_gateways': {
-                'count': IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False).count(),
-                'savings': sum(float(api.monthly_cost) for api in IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False)),
+                'count': api_instances.count(),
+                'savings': sum(float(api.monthly_cost) for api in api_instances),
                 'items': [
                     {
                         'api_id': api.api_id,
@@ -5127,13 +5143,13 @@ def scan_all_idle_resources_advanced(request, account_id):
                         'monthly_cost': float(api.monthly_cost),
                         'reasons': api.reasons
                     }
-                    for api in IdleAPIGateway.objects.filter(aws_account=account, is_resolved=False)
+                    for api in api_instances
                 ]
             },
             'cloudwatch': {
                 'log_groups': {
-                    'count': IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False).count(),
-                    'savings': sum(float(lg.monthly_cost) for lg in IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False)),
+                    'count': log_groups.count(),
+                    'savings': sum(float(lg.monthly_cost) for lg in log_groups),
                     'items': [
                         {
                             'log_group_name': lg.log_group_name,
@@ -5143,12 +5159,12 @@ def scan_all_idle_resources_advanced(request, account_id):
                             'monthly_cost': float(lg.monthly_cost),
                             'reasons': lg.reasons
                         }
-                        for lg in IdleCloudWatchLogGroup.objects.filter(aws_account=account, is_resolved=False)
+                        for lg in log_groups
                     ]
                 },
                 'alarms': {
-                    'count': IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False).count(),
-                    'savings': sum(float(alarm.monthly_cost) for alarm in IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False)),
+                    'count': alarms.count(),
+                    'savings': sum(float(alarm.monthly_cost) for alarm in alarms),
                     'items': [
                         {
                             'alarm_name': alarm.alarm_name,
@@ -5157,23 +5173,23 @@ def scan_all_idle_resources_advanced(request, account_id):
                             'monthly_cost': float(alarm.monthly_cost),
                             'reasons': alarm.reasons
                         }
-                        for alarm in IdleCloudWatchAlarm.objects.filter(aws_account=account, is_resolved=False)
+                        for alarm in alarms
                     ]
                 },
                 'dashboards': {
-                    'count': IdleCloudWatchDashboard.objects.filter(aws_account=account, is_resolved=False).count(),
+                    'count': dashboards.count(),
                     'items': [
                         {
                             'dashboard_name': dash.dashboard_name,
                             'days_since_modified': dash.days_since_modified,
                             'reasons': dash.reasons
                         }
-                        for dash in IdleCloudWatchDashboard.objects.filter(aws_account=account, is_resolved=False)
+                        for dash in dashboards
                     ]
                 },
                 'metrics': {
-                    'count': IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False).count(),
-                    'savings': sum(float(metric.monthly_cost) for metric in IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False)),
+                    'count': metrics.count(),
+                    'savings': sum(float(metric.monthly_cost) for metric in metrics),
                     'items': [
                         {
                             'namespace': metric.namespace,
@@ -5181,7 +5197,7 @@ def scan_all_idle_resources_advanced(request, account_id):
                             'monthly_cost': float(metric.monthly_cost),
                             'reasons': metric.reasons
                         }
-                        for metric in IdleCloudWatchMetric.objects.filter(aws_account=account, is_resolved=False)
+                        for metric in metrics
                     ]
                 }
             }
@@ -5193,6 +5209,8 @@ def scan_all_idle_resources_advanced(request, account_id):
         return Response({'error': 'AWS account not found'}, status=404)
     except Exception as e:
         logger.error(f"Error in idle resources scan: {e}")
+        import traceback
+        traceback.print_exc()
         return Response({'error': str(e)}, status=500)
 
 @api_view(['DELETE'])
@@ -6262,6 +6280,7 @@ from .storage_optimization_service import (
     test_unused_amis
 )
 
+# views.py - Replace your run_complete_storage_scan function
 
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
@@ -6276,24 +6295,42 @@ def run_complete_storage_scan(request, account_id):
         account = AWSAccount.objects.get(id=account_id, user=request.user, status='connected')
         force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
         
+        print(f"🔍 Storage Scan - force_refresh: {force_refresh}")
+        
         # Check for cached results first (unless force_refresh is true)
         if not force_refresh:
+            from .storage_optimization_service import get_cached_storage_results
             cached_results = get_cached_storage_results(request.user, account, force_refresh=False)
             if cached_results:
+                print("📦 Returning cached storage results from database")
                 return Response(cached_results, status=200)
         
         # Force refresh - make fresh AWS API calls
         logger.info(f"🔄 Running fresh storage scan for account {account.account_id}")
         
-        # Run all scans in parallel (simplified - sequentially for reliability)
+        from .storage_optimization_service import (
+            test_ebs_volumes,
+            test_elastic_ips,
+            test_rds_instances,
+            test_snapshots,
+            test_unattached_ebs_volumes_only,
+            test_duplicate_snapshots,
+            test_idle_rds_instances,
+            test_unused_amis,
+            save_scan_results_to_db
+        )
+        
+        print("📊 Running storage scans...")
+        
+        # Run all scans
+        ebs_result = test_ebs_volumes(account.role_arn, str(account.external_id))
+        eip_result = test_elastic_ips(account.role_arn, str(account.external_id))
+        rds_result = test_rds_instances(account.role_arn, str(account.external_id))
+        snapshot_result = test_snapshots(account.role_arn, str(account.external_id))
         unattached_ebs_result = test_unattached_ebs_volumes_only(account.role_arn, str(account.external_id))
         duplicate_snapshot_result = test_duplicate_snapshots(account.role_arn, str(account.external_id))
         idle_rds_result = test_idle_rds_instances(account.role_arn, str(account.external_id))
         unused_amis_result = test_unused_amis(account.role_arn, str(account.external_id))
-        eip_result = test_elastic_ips(account.role_arn, str(account.external_id))
-        ebs_result = test_ebs_volumes(account.role_arn, str(account.external_id))
-        snapshot_result = test_snapshots(account.role_arn, str(account.external_id))
-        rds_result = test_rds_instances(account.role_arn, str(account.external_id))
         
         total_findings = (
             unattached_ebs_result.get('count', 0) +
@@ -6368,16 +6405,19 @@ def run_complete_storage_scan(request, account_id):
         }
         
         # Save results to database
+        print("💾 Saving storage results to database...")
         save_scan_results_to_db(request.user, account, scan_results)
         
+        # Return the fresh results
         return Response(scan_results, status=200)
         
     except AWSAccount.DoesNotExist:
         return Response({'error': 'AWS account not found', 'success': False}, status=404)
     except Exception as e:
         logger.error(f"Storage scan error: {e}")
+        import traceback
+        traceback.print_exc()
         return Response({'error': str(e), 'success': False}, status=500)
-
 
 @api_view(['DELETE'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
