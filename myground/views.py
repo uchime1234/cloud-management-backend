@@ -1340,24 +1340,30 @@ from django.utils import timezone
 # GITHUB INTEGRATION ENDPOINTS
 
 # ============================================================
-
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def github_auth_url(request):
-    """
-    Get GitHub OAuth URL for user to authorize
-    """
-    # ✅ Pass user ID in state to retrieve after callback
+    print("=" * 60)
+    print("🔍 GITHUB AUTH URL REQUEST RECEIVED")
+    print(f"User: {request.user.username}")
+    print(f"GITHUB_CLIENT_ID from settings: {settings.GITHUB_CLIENT_ID}")
+    print(f"GITHUB_REDIRECT_URI from settings: {settings.GITHUB_REDIRECT_URI}")
+    
     auth_url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={settings.GITHUB_CLIENT_ID}"
         f"&redirect_uri={settings.GITHUB_REDIRECT_URI}"
         f"&scope=repo,read:user"
-        f"&state={request.user.id}"  # ✅ Pass user ID
+        f"&state={request.user.id}"
     )
+    
+    print(f"Generated auth URL: {auth_url}")
+    print("=" * 60)
+    
     return Response({'auth_url': auth_url}, status=200)
 
+    
 @api_view(['GET', 'POST'])
 def github_callback(request):
     code = request.GET.get('code') or request.data.get('code')
