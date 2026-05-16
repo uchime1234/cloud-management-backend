@@ -1348,12 +1348,12 @@ def github_auth_url(request):
     print("🔍 GITHUB AUTH URL REQUEST RECEIVED")
     print(f"User: {request.user.username}")
     print(f"GITHUB_CLIENT_ID from settings: {settings.GITHUB_CLIENT_ID}")
-    print(f"GITHUB_REDIRECT_URI from settings: {settings.GITHUB_REDIRECT_URI}")
+    print(f"GITHUB_REDIRECT_URI from settings: {settings.GITHUB_REDIRECT_URL}")
     
     auth_url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={settings.GITHUB_CLIENT_ID}"
-        f"&redirect_uri={settings.GITHUB_REDIRECT_URI}"
+        f"&redirect_uri={settings.GITHUB_REDIRECT_URL}"
         f"&scope=repo,read:user"
         f"&state={request.user.id}"
     )
@@ -1363,7 +1363,7 @@ def github_auth_url(request):
     
     return Response({'auth_url': auth_url}, status=200)
 
-    
+
 @api_view(['GET', 'POST'])
 def github_callback(request):
     code = request.GET.get('code') or request.data.get('code')
