@@ -35,6 +35,7 @@ import json
 # from .serializers import AWSAccountConnectionSerializer, CostAnalyticsSerializer, ResourceSummarySerializer
 from .models import VerificationCode, MFAConfiguration, BackupCode, MFALog, CostDriver, AWSCostCache  # AWSAccountConnection, MonthlyCostSummary, DailySpend, RecentDailySpend, ResourceSummary, LowLevelServiceSnapshot, LowLevelServiceCategory, LowLevelServiceCostHistory, LowLevelServiceDefinition, LowLevelServiceResource 
 import uuid
+import os
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
@@ -1363,11 +1364,10 @@ def github_auth_url(request):
     
     return Response({'auth_url': auth_url}, status=200)
 
-
 @api_view(['GET', 'POST'])
 def github_callback(request):
     code = request.GET.get('code') or request.data.get('code')
-    state = request.GET.get('state')  # User ID from state
+    state = request.GET.get('state')
     
     print(f"🔍 GitHub callback received - code: {code[:10] if code else 'None'}..., state: {state}")
     
@@ -1376,7 +1376,6 @@ def github_callback(request):
     
     if not state:
         print("⚠️ No state parameter received - falling back to authenticated user")
-        # If no state, try to get user from authentication
         if request.user.is_authenticated:
             user = request.user
         else:
@@ -1387,7 +1386,7 @@ def github_callback(request):
         except User.DoesNotExist:
             return Response({'error': 'Invalid user'}, status=400)
     
-    # Exchange code for token
+    # Exchange code for token - make sure GITHUB_REDIRECT_URI is passed
     access_token = exchange_code_for_token(code)
     if not access_token:
         print("❌ Failed to get access token")
@@ -1416,13 +1415,9 @@ def github_callback(request):
     
     print(f"{'Created' if created else 'Updated'} GitHubUser for {user.username}")
     
-    # Return JSON response for frontend (since this is an API)
-    # The frontend will handle the redirect
-    return Response({
-        'success': True,
-        'username': github_user_data.get('login'),
-        'message': 'GitHub connected successfully'
-    }, status=200)
+    # Redirect to frontend success page instead of returning JSON
+    frontend_url = 'https://cloud-management-frontend.vercel.app/cost-analytics/aws'
+    return redirect(f'{frontend_url}/dashboard?github_connected=true')
 
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
