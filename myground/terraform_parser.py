@@ -791,21 +791,39 @@ class TerraformCostEstimator:
                     monthly_cost += estimated_lcus * pricing['lcu_price'] * 730
             
             # API Gateway pricing
+            # terraform_parser.py - Update the API Gateway pricing section
+
             elif resource_type in ['aws_api_gateway_rest_api', 'aws_apigatewayv2_api']:
-                # Assume 1 million requests per month
-                if 'api_gateway_rest_cost' in pricing:
-                    monthly_cost = pricing['api_gateway_rest_cost']
-                elif 'api_gateway_http_cost' in pricing:
-                    monthly_cost = pricing['api_gateway_http_cost']
+                # Check if it's HTTP API (v2) or REST API (v1)
+                is_http_api = resource_type == 'aws_apigatewayv2_api'
+                
+                # Get estimated requests from config or use realistic default
+                estimated_requests = config.get('estimated_requests_per_month', 1000000)  # Default 1M
+                
+                # Apply free tier
+                free_tier = 1000000  # 1 million requests free
+                billable_requests = max(0, estimated_requests - free_tier)
+                
+                if is_http_api:
+                    # HTTP API: $1.00 per million requests after free tier
+                    monthly_cost = (billable_requests / 1000000) * 1.00
                 else:
-                    monthly_cost = 3.50
+                    # REST API: $3.50 per million requests after free tier
+                    monthly_cost = (billable_requests / 1000000) * 3.50
+                
+                # Additional: Data transfer (~$0.09 per GB)
+                # Assuming 1KB per request average
+                data_transfer_gb = (estimated_requests * 0.001) / 1024  # Convert KB to GB
+                data_cost = data_transfer_gb * 0.09
+                
+                monthly_cost += data_cost
                 hourly_cost = monthly_cost / 730
-            
-            # Route53 pricing
+                        
+                # Route53 pricing
             elif resource_type == 'aws_route53_zone':
                 monthly_cost = pricing
                 hourly_cost = monthly_cost / 730
-            
+        
             # CloudFront pricing
             elif resource_type == 'aws_cloudfront_distribution':
                 # Assume 100 GB data transfer and 100,000 requests
