@@ -390,6 +390,7 @@ class GitHubService:
             return None
         
 
+# github_service.py
 
 def exchange_code_for_token(code):
     """
@@ -401,43 +402,47 @@ def exchange_code_for_token(code):
     for attempt in range(max_retries):
         try:
             url = "https://github.com/login/oauth/access_token"
+            
+            # Make sure you're using the correct redirect URI
             payload = {
                 "client_id": settings.GITHUB_CLIENT_ID,
                 "client_secret": settings.GITHUB_CLIENT_SECRET,
                 "code": code,
-                "redirect_uri": settings.GITHUB_REDIRECT_URI
+                "redirect_uri": settings.GITHUB_REDIRECT_URL,  # Add this!
             }
-            headers = {"Accept": "application/json", "User-Agent": "CloudManagementApp/1.0"}
             
-            # Always use verify=False for Windows compatibility
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": "CloudManagementApp/1.0"
+            }
+            
+            print(f"🔄 Exchanging code for token...")
+            print(f"   Client ID: {settings.GITHUB_CLIENT_ID}")
+            print(f"   Redirect URI: {settings.GITHUB_REDIRECT_URL}")
+            
             response = requests.post(url, data=payload, headers=headers, timeout=30, verify=False)
-            response.raise_for_status()
             
+            print(f"   Response status: {response.status_code}")
+            
+            response.raise_for_status()
             data = response.json()
             
             if 'access_token' in data:
-                logger.info("Successfully exchanged code for token")
+                print(f"✅ Successfully exchanged code for token")
                 return data['access_token']
             else:
-                logger.error(f"Token exchange failed: {data}")
+                print(f"❌ Token exchange failed: {data}")
                 if attempt == max_retries - 1:
                     return None
                     
-        except requests.exceptions.SSLError as e:
-            logger.warning(f"SSL error on attempt {attempt + 1}: {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request failed (attempt {attempt + 1}): {e}")
             if attempt == max_retries - 1:
                 return None
             time.sleep(retry_delay)
             retry_delay *= 2
-            
-        except Exception as e:
-            logger.error(f"Failed to exchange code for token: {e}")
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(retry_delay)
     
     return None
-
 
 def get_user_from_token(access_token):
     """
