@@ -1355,3 +1355,5 @@ class IdleCloudWatchMetric(models.Model):
     
     class Meta:
         ordering = ['-detected_at']
+
+

@@ -143,4 +143,5 @@ path('storage-clear/<int:account_id>/', views.clear_storage_cache, name='clear_s
 # Add to urlpatterns
 path('aws/accounts/<int:account_db_id>/service-breakdown-db/', views.get_service_breakdown_from_db, name='service_breakdown_db'),
 path('idle-resources/clear/<int:account_id>/', views.clear_idle_results_cache, name='clear_idle_cache'),
+path('user/delete-account/', views.delete_user_account, name='delete_user_account'),
 ]

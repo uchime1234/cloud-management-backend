@@ -6445,3 +6445,79 @@ def clear_storage_cache(request, account_id):
     except Exception as e:
         logger.error(f"Error clearing storage cache: {e}")
         return Response({'error': str(e)}, status=500)
+
+# Add this function to your views.py
+
+@api_view(['DELETE'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def delete_user_account(request):
+    """
+    Permanently delete user account and all associated data
+    """
+    try:
+        user = request.user
+        username = user.username
+        email = user.email
+        
+        logger.warning(f"⚠️ Account deletion requested for user: {username} ({email})")
+        
+        # Delete all associated data
+        # The cascade will handle related models if set up correctly
+        # But we'll explicitly delete major associations for safety
+        
+        # Delete AWS accounts and related data
+        from .models import AWSAccount, CostDataHistory, CostDriver, AWSCostAnalysis, ResourceSummary
+        from .models import LowLevelServiceSnapshot, LowLevelServiceResource, LowLevelServiceCostHistory
+        
+        # Delete AWS accounts (this will cascade to many related models)
+        aws_accounts_deleted = AWSAccount.objects.filter(user=user).delete()[0]
+        
+        # Delete GitHub connections
+        from .models import GitHubUser, GitHubRepo, DeploymentEvent
+        github_user_deleted = GitHubUser.objects.filter(user=user).delete()[0]
+        github_repos_deleted = GitHubRepo.objects.filter(user=user).delete()[0]
+        deployments_deleted = DeploymentEvent.objects.filter(repo__user=user).delete()[0]
+        
+        # Delete any remaining orphaned data
+        CostDataHistory.objects.filter(aws_account__user=user).delete()
+        CostDriver.objects.filter(aws_account__user=user).delete()
+        AWSCostAnalysis.objects.filter(aws_account__user=user).delete()
+        ResourceSummary.objects.filter(account__user=user).delete()
+        LowLevelServiceSnapshot.objects.filter(account__user=user).delete()
+        LowLevelServiceResource.objects.filter(account__user=user).delete()
+        LowLevelServiceCostHistory.objects.filter(account__user=user).delete()
+        
+        # Delete MFA configurations
+        from .models import MFAConfiguration, BackupCode, MFALog
+        MFAConfiguration.objects.filter(user=user).delete()
+        BackupCode.objects.filter(user=user).delete()
+        MFALog.objects.filter(user=user).delete()
+        
+        # Delete verification codes
+        VerificationCode.objects.filter(email=email).delete()
+        
+        # Delete auth tokens
+        Token.objects.filter(user=user).delete()
+        
+        # Finally delete the user
+        user.delete()
+        
+        logger.info(f"✅ Account permanently deleted: {username} ({email})")
+        
+        return Response({
+            'success': True,
+            'message': 'Your account has been permanently deleted. All data has been removed.',
+            'deleted_counts': {
+                'aws_accounts': aws_accounts_deleted,
+                'github_data': github_user_deleted + github_repos_deleted,
+                'deployments': deployments_deleted
+            }
+        }, status=200)
+        
+    except Exception as e:
+        logger.error(f"Error deleting user account: {e}")
+        return Response({
+            'success': False,
+            'error': f'Failed to delete account: {str(e)}'
+        }, status=500)

@@ -193,3 +193,297 @@ def clear_iam_findings(request, account_id):
         return Response({'error': 'AWS account not found'}, status=404)
     except Exception as e:
         return Response({'error': str(e)}, status=500)
+
+
+# Add to security/views.py
+
+from .models import PublicExposureFinding, PublicExposureReport
+from .serilizers import PublicExposureFindingSerializer, PublicExposureReportSerializer
+from .Public_exposure_scanner import scan_public_exposures, generate_public_exposure_ai_analysis
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def scan_public_exposure_view(request, account_id):
+    """
+    Scan for public exposures in AWS account
+    """
+    try:
+        account = AWSAccount.objects.get(id=account_id, user=request.user, status='connected')
+        force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
+        
+        # Check for cached results
+        if not force_refresh:
+            cached_findings = PublicExposureFinding.objects.filter(
+                aws_account=account,
+                is_resolved=False
+            )
+            cached_report = PublicExposureReport.objects.filter(aws_account=account).first()
+            
+            if cached_findings.exists() and cached_report:
+                serializer = PublicExposureFindingSerializer(cached_findings, many=True)
+                return Response({
+                    'success': True,
+                    'cached': True,
+                    'total_findings': cached_findings.count(),
+                    'findings': serializer.data,
+                    'ai_analysis': cached_report.ai_analysis,
+                    'report_summary': {
+                        'critical': cached_report.critical_count,
+                        'high': cached_report.high_count,
+                        'medium': cached_report.medium_count,
+                        'low': cached_report.low_count,
+                        'generated_at': cached_report.created_at
+                    }
+                }, status=200)
+        
+        # Delete old findings
+        PublicExposureFinding.objects.filter(aws_account=account).delete()
+        PublicExposureReport.objects.filter(aws_account=account).delete()
+        
+        # Run fresh scan
+        scan_result = scan_public_exposures(
+            account.role_arn,
+            str(account.external_id),
+            'us-east-1'
+        )
+        
+        if scan_result.get('error'):
+            return Response({
+                'success': False,
+                'error': scan_result['error']
+            }, status=500)
+        
+        # Save findings to database
+        saved_findings = []
+        for finding_data in scan_result['findings']:
+            finding = PublicExposureFinding.objects.create(
+                user=request.user,
+                aws_account=account,
+                exposure_type=finding_data.get('finding_type', 'public_ec2'),
+                severity=finding_data.get('severity', 'MEDIUM'),
+                resource_name=finding_data.get('instance_name') or 
+                             finding_data.get('bucket_name') or 
+                             finding_data.get('lb_name') or 
+                             finding_data.get('security_group_name') or
+                             finding_data.get('api_name') or
+                             finding_data.get('resource_name', 'Unknown'),
+                resource_id=finding_data.get('instance_id') or 
+                           finding_data.get('bucket_name') or
+                           finding_data.get('api_id') or '',
+                region=finding_data.get('region', ''),
+                public_ip=finding_data.get('public_ip', ''),
+                port=finding_data.get('port'),
+                protocol=finding_data.get('protocol', ''),
+                cidr=finding_data.get('cidr', ''),
+                security_group_name=finding_data.get('security_group_name', ''),
+                security_group_id=finding_data.get('security_group_id', ''),
+                details=finding_data,
+                title=finding_data.get('title', generate_title(finding_data)),
+                description=finding_data.get('description', generate_description(finding_data)),
+                recommendation=finding_data.get('recommendation', generate_recommendation(finding_data)),
+                is_resolved=False
+            )
+            saved_findings.append(finding)
+        
+        # Count by severity
+        critical_count = len([f for f in scan_result['findings'] if f.get('severity') == 'CRITICAL'])
+        high_count = len([f for f in scan_result['findings'] if f.get('severity') == 'HIGH'])
+        medium_count = len([f for f in scan_result['findings'] if f.get('severity') == 'MEDIUM'])
+        low_count = len([f for f in scan_result['findings'] if f.get('severity') == 'LOW'])
+        
+        # Generate AI analysis
+        ai_analysis = generate_public_exposure_ai_analysis(
+            scan_result['findings'],
+            account.account_alias or account.account_id
+        )
+        
+        # Save report
+        report = PublicExposureReport.objects.create(
+            user=request.user,
+            aws_account=account,
+            ai_analysis=ai_analysis,
+            total_findings=len(saved_findings),
+            critical_count=critical_count,
+            high_count=high_count,
+            medium_count=medium_count,
+            low_count=low_count
+        )
+        
+        serializer = PublicExposureFindingSerializer(saved_findings, many=True)
+        
+        return Response({
+            'success': True,
+            'cached': False,
+            'total_findings': len(saved_findings),
+            'findings': serializer.data,
+            'ai_analysis': ai_analysis,
+            'report_summary': {
+                'critical': critical_count,
+                'high': high_count,
+                'medium': medium_count,
+                'low': low_count,
+                'generated_at': report.created_at
+            }
+        }, status=200)
+        
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Error scanning public exposures: {e}")
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def get_public_exposure_findings(request, account_id):
+    """Get cached public exposure findings"""
+    try:
+        account = AWSAccount.objects.get(id=account_id, user=request.user)
+        
+        findings = PublicExposureFinding.objects.filter(
+            aws_account=account,
+            is_resolved=False
+        ).order_by('-severity', '-detected_at')
+        
+        report = PublicExposureReport.objects.filter(aws_account=account).first()
+        
+        critical = findings.filter(severity='CRITICAL').count()
+        high = findings.filter(severity='HIGH').count()
+        medium = findings.filter(severity='MEDIUM').count()
+        low = findings.filter(severity='LOW').count()
+        
+        serializer = PublicExposureFindingSerializer(findings, many=True)
+        
+        return Response({
+            'success': True,
+            'cached': True,
+            'total_findings': findings.count(),
+            'critical': critical,
+            'high': high,
+            'medium': medium,
+            'low': low,
+            'findings': serializer.data,
+            'ai_analysis': report.ai_analysis if report else None,
+            'report_summary': {
+                'generated_at': report.created_at if report else None
+            }
+        }, status=200)
+        
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['DELETE'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def clear_public_exposure_findings(request, account_id):
+    """Clear all public exposure findings"""
+    try:
+        account = AWSAccount.objects.get(id=account_id, user=request.user)
+        
+        findings_deleted, _ = PublicExposureFinding.objects.filter(aws_account=account).delete()
+        report_deleted, _ = PublicExposureReport.objects.filter(aws_account=account).delete()
+        
+        return Response({
+            'success': True,
+            'message': f'Cleared {findings_deleted} public exposure findings',
+            'findings_deleted': findings_deleted,
+            'report_deleted': report_deleted
+        }, status=200)
+        
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['PUT'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def resolve_public_exposure_finding(request, finding_id):
+    """Mark a finding as resolved"""
+    try:
+        finding = PublicExposureFinding.objects.get(id=finding_id, user=request.user)
+        finding.is_resolved = True
+        finding.save()
+        
+        return Response({
+            'success': True,
+            'message': 'Finding marked as resolved'
+        }, status=200)
+        
+    except PublicExposureFinding.DoesNotExist:
+        return Response({'error': 'Finding not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
+
+
+def generate_title(finding):
+    """Generate title for finding based on type"""
+    finding_type = finding.get('finding_type', '')
+    resource = finding.get('instance_name') or finding.get('bucket_name') or finding.get('lb_name') or 'Resource'
+    
+    titles = {
+        'public_ec2': f'EC2 instance "{resource}" is publicly accessible',
+        'open_sg_rule': f'Security group "{finding.get("security_group_name", resource)}" has open rule from anywhere',
+        'public_rds': f'RDS instance "{resource}" is publicly accessible',
+        'public_s3': f'S3 bucket "{resource}" has public access',
+        'public_lb': f'Load Balancer "{resource}" is internet-facing',
+        'public_eks': f'EKS cluster "{resource}" has public API endpoint',
+        'public_redis': f'Redis cluster "{resource}" is publicly accessible',
+        'public_opensearch': f'OpenSearch domain "{resource}" is publicly accessible',
+        'public_api': f'API Gateway "{resource}" has no authentication',
+        'missing_waf': f'"{resource}" has no WAF protection'
+    }
+    
+    return titles.get(finding_type, f'Public exposure found in "{resource}"')
+
+
+def generate_description(finding):
+    """Generate description for finding"""
+    finding_type = finding.get('finding_type', '')
+    resource = finding.get('instance_name') or finding.get('bucket_name') or finding.get('lb_name') or 'Resource'
+    public_ip = finding.get('public_ip', '')
+    port = finding.get('port', '')
+    protocol = finding.get('protocol', 'tcp')
+    cidr = finding.get('cidr', '0.0.0.0/0')
+    
+    descriptions = {
+        'public_ec2': f'EC2 instance "{resource}" has public IP {public_ip} and can be accessed from the internet. This exposes your instance to potential attacks including brute force, DoS, and vulnerability exploitation.',
+        'open_sg_rule': f'Security group allows {protocol}:{port} access from {cidr}. This means anyone on the internet can attempt to connect to resources using this security group.',
+        'public_rds': f'RDS instance "{resource}" is configured as publicly accessible on port {port}. Your database can be accessed directly from the internet, making it vulnerable to data breaches.',
+        'public_s3': f'S3 bucket "{resource}" allows public access. Anyone with the bucket URL can read or write data, potentially exposing sensitive information.',
+        'public_lb': f'Load Balancer "{resource}" is internet-facing and accessible from anywhere. Without proper WAF protection, it is vulnerable to DDoS and application attacks.',
+        'public_eks': f'EKS cluster "{resource}" has public API endpoint enabled. The Kubernetes API server is exposed to the internet, a critical security risk.',
+        'public_redis': f'Redis cluster "{resource}" is publicly accessible on port {port}. Redis has no built-in authentication and is frequently targeted by attackers for data theft.',
+        'public_opensearch': f'OpenSearch domain "{resource}" has public access enabled. Your search data and analytics could be exposed to unauthorized users.',
+        'public_api': f'API Gateway "{resource}" has no authentication or authorizer configured. Anyone can invoke your API endpoints without credentials.',
+        'missing_waf': f'"{resource}" has no Web Application Firewall (WAF) attached. This leaves it unprotected against common web exploits like SQL injection and XSS.'
+    }
+    
+    return descriptions.get(finding_type, f'Public exposure detected in {resource}')
+
+
+def generate_recommendation(finding):
+    """Generate recommendation for fixing the finding"""
+    finding_type = finding.get('finding_type', '')
+    
+    recommendations = {
+        'public_ec2': 'Remove the public IP by using a private subnet with NAT gateway, or restrict security group rules to specific IP ranges (not 0.0.0.0/0). Use AWS Systems Manager Session Manager for secure access.',
+        'open_sg_rule': 'Restrict security group rules to specific IP ranges or VPC CIDRs. Use security group referencing instead of IP ranges when possible. Enable AWS WAF for web traffic.',
+        'public_rds': 'Set PubliclyAccessible=false in RDS configuration. Move RDS to private subnets and access via bastion host or VPC peering.',
+        'public_s3': 'Enable "Block all public access" on the S3 bucket. Review and remove public bucket policies and ACLs. Use pre-signed URLs for temporary access.',
+        'public_lb': 'Consider making the load balancer internal. If it must be public, attach AWS WAF and enable AWS Shield Advanced. Implement strict security group rules.',
+        'public_eks': 'Disable public endpoint access. Use VPC endpoint for private API server access. Enable AWS PrivateLink for secure connectivity.',
+        'public_redis': 'Move Redis to private subnets and use VPC peering or VPN for access. Enable encryption at rest and in transit. Use Redis AUTH if possible.',
+        'public_opensearch': 'Disable public access and use VPC. Configure fine-grained access control. Enable encryption and IP-based restrictions.',
+        'public_api': 'Add Cognito authorizer, API keys, or IAM authentication. Implement rate limiting and usage plans. Enable WAF for API protection.',
+        'missing_waf': 'Attach AWS WAF Web ACL to the resource. Configure rules for common threats like SQL injection, XSS, and rate limiting.'
+    }
+    
+    return recommendations.get(finding_type, 'Review and restrict public access to this resource following AWS security best practices.')
