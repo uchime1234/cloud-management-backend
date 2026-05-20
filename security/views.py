@@ -198,7 +198,7 @@ def clear_iam_findings(request, account_id):
 # Add to security/views.py
 
 from .models import PublicExposureFinding, PublicExposureReport
-from .serilizers import PublicExposureFindingSerializer, PublicExposureReportSerializer
+from .serlizers import PublicExposureFindingSerializer, PublicExposureReportSerializer
 from .Public_exposure_scanner import scan_public_exposures, generate_public_exposure_ai_analysis
 
 
