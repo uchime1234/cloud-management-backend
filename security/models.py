@@ -600,7 +600,7 @@ class SecurityGroupAuditLog(models.Model):
         ('group_modified', 'Group Modified'),
     ]
     
-    security_group = models.ForeignKey('SecurityGroupAnalysis', on_delete=models.CASCADE, related_name='change_logs')
+    security_group = models.ForeignKey('SecurityGroupAnalysis', on_delete=models.CASCADE, related_name='audit_logs')
     timestamp = models.DateTimeField(auto_now_add=True)
     actor = models.CharField(max_length=255, blank=True)  # IAM user/role
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
