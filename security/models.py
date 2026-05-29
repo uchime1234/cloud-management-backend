@@ -584,3 +584,32 @@ class EncryptionRecommendation(models.Model):
     
     def __str__(self):
         return f"{self.resource_name}: {self.recommendation_title}"
+
+
+# Add to security/models.py
+
+class SecurityGroupAuditLog(models.Model):
+    """Audit log for security group changes"""
+    
+    ACTION_CHOICES = [
+        ('rule_added', 'Rule Added'),
+        ('rule_removed', 'Rule Removed'),
+        ('rule_modified', 'Rule Modified'),
+        ('group_created', 'Group Created'),
+        ('group_deleted', 'Group Deleted'),
+        ('group_modified', 'Group Modified'),
+    ]
+    
+    security_group = models.ForeignKey('SecurityGroupAnalysis', on_delete=models.CASCADE, related_name='change_logs')
+    timestamp = models.DateTimeField(auto_now_add=True)
+    actor = models.CharField(max_length=255, blank=True)  # IAM user/role
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES)
+    summary = models.CharField(max_length=500)
+    before = models.JSONField(default=dict, blank=True)
+    after = models.JSONField(default=dict, blank=True)
+    
+    class Meta:
+        ordering = ['-timestamp']
+    
+    def __str__(self):
+        return f"{self.security_group.security_group_name} - {self.action} at {self.timestamp}"
