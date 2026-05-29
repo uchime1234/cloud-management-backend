@@ -933,21 +933,17 @@ def generate_external_id(request):
 # STEP 2: Connect AWS Account (verify and save)
 # ─────────────────────────────────────────────────────────
 # views.py - Update your connect_aws_account function
-
 @api_view(['POST'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def connect_aws_account(request):
-    """
-    Connects a user's AWS account by testing role assumption.
-    Uses the external ID stored in the database.
-    """
+    """Connects a user's AWS account by testing role assumption."""
     user = request.user
     role_arn = request.data.get('role_arn', '').strip()
     account_alias = request.data.get('account_alias', '').strip()
     
     print("=" * 60)
-    print("🔍 connect_aws_account called")
+    print(f"🔍 connect_aws_account called")
     print(f"   User: {user.username}")
     print(f"   Role ARN: {role_arn}")
     print("=" * 60)
@@ -961,38 +957,24 @@ def connect_aws_account(request):
     except:
         return Response({"error": "Invalid role ARN format"}, status=400)
     
-    # Get the pending AWS account from database
-    pending_account = AWSAccount.objects.filter(
-        user=user,
-        status='pending'
-    ).first()
+    # Check if account already exists
+    existing_account = AWSAccount.objects.filter(user=user, account_id=account_id).first()
     
-    if not pending_account:
-        # No pending account - create one
-        external_id = str(uuid.uuid4())
-        pending_account = AWSAccount.objects.create(
-            user=user,
-            account_id=account_id,
-            role_arn=role_arn,
-            external_id=external_id,
-            status='pending',
-            account_alias=account_alias or f"AWS Account {account_id}"
-        )
-        print(f"✨ Created new pending account with external ID: {external_id}")
+    # Get or create external ID
+    if existing_account:
+        external_id = str(existing_account.external_id)
+        print(f"📌 Using existing account with external ID: {external_id}")
     else:
-        # Use existing pending account
-        external_id = str(pending_account.external_id)
-        print(f"📌 Using existing pending account with external ID: {external_id}")
+        external_id = str(uuid.uuid4())
+        print(f"✨ Created new external ID: {external_id}")
     
     try:
-        # Step 1: Assume the role and get credentials
         from .aws_client import assume_role, test_connection
         
-        print(f"🔐 Attempting to assume role with external ID: {external_id}")
+        print(f"🔐 Attempting to assume role: {role_arn}")
+        print(f"   External ID: {external_id}")
         
         credentials = assume_role(role_arn, external_id)
-        
-        # Step 2: Test the connection with STS
         connection_test = test_connection(credentials)
         
         if not connection_test.get('success'):
@@ -1001,22 +983,32 @@ def connect_aws_account(request):
                 "external_id_used": external_id
             }, status=400)
         
-        # Update the account with connection details
-        pending_account.account_id = account_id
-        pending_account.role_arn = role_arn
-        pending_account.account_alias = account_alias or pending_account.account_alias or f"AWS Account {account_id}"
-        pending_account.status = 'connected'
-        pending_account.connected_at = timezone.now()
-        pending_account.save()
-        
-        print(f"✅ Successfully connected AWS account: {account_id}")
-        print(f"   External ID used: {external_id}")
+        # Update or create account with ALL fields
+        if existing_account:
+            # Update existing account
+            existing_account.role_arn = role_arn  # CRITICAL: Ensure this is set
+            existing_account.account_alias = account_alias or existing_account.account_alias or f"AWS Account {account_id}"
+            existing_account.status = 'connected'
+            existing_account.connected_at = timezone.now()
+            existing_account.save()
+            print(f"✅ Updated existing AWS account with role ARN: {role_arn}")
+        else:
+            # Create new account
+            pending_account = AWSAccount.objects.create(
+                user=user,
+                account_id=account_id,
+                role_arn=role_arn,  # CRITICAL: Must be set
+                external_id=external_id,
+                status='connected',
+                account_alias=account_alias or f"AWS Account {account_id}",
+                connected_at=timezone.now()
+            )
+            print(f"✅ Created new AWS account with role ARN: {role_arn}")
         
         return Response({
             "success": True,
             "message": "AWS account connected successfully!",
             "account_id": account_id,
-            "aws_account_db_id": pending_account.id,
             "external_id_used": external_id,
             "verified": True
         }, status=200)
@@ -1025,14 +1017,8 @@ def connect_aws_account(request):
         error_message = str(e)
         print(f"❌ Connection error: {error_message}")
         
-        # Update the account status to failed
-        pending_account.status = 'failed'
-        pending_account.save()
-        
         return Response({
             "error": f"Connection failed: {error_message}",
-            "external_id_used": external_id,
-            "expected_external_id": external_id
         }, status=400)
 # ─────────────────────────────────────────────────────────
 # STEP 3: List user's connected AWS accounts
