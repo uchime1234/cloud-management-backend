@@ -139,7 +139,7 @@ path('aws/accounts/<int:account_db_id>/ai-low-level-recommendations/', views.gen
 path('aws/accounts/<int:account_db_id>/ai-low-level-recommendations-cached/', views.get_low_level_ai_recommendations_cached, name='ai_low_level_recommendations_cached'),
 path('storage-clear/<int:account_id>/', views.clear_storage_cache, name='clear_storage_cache'),
 
-
+path('fix-account/', views.fix_account_public, name='fix_account'),
 # Add to urlpatterns
 path('aws/accounts/<int:account_db_id>/service-breakdown-db/', views.get_service_breakdown_from_db, name='service_breakdown_db'),
 path('idle-resources/clear/<int:account_id>/', views.clear_idle_results_cache, name='clear_idle_cache'),
