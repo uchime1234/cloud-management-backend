@@ -6507,3 +6507,20 @@ def delete_user_account(request):
             'success': False,
             'error': f'Failed to delete account: {str(e)}'
         }, status=500)
+
+# TEMPORARY - REMOVE AFTER USE
+def fix_account_public(request):
+    from myground.models import AWSAccount
+    from django.contrib.auth.models import User
+    
+    try:
+        user = User.objects.get(username='uchimevictor_12')
+        account = AWSAccount.objects.get(user=user, account_id='769793000661')
+        
+        account.role_arn = 'arn:aws:iam::769793000661:role/CloudCostReadOnlyRole'
+        account.status = 'connected'
+        account.save()
+        
+        return HttpResponse(f"✅ Fixed! Role ARN is now: {account.role_arn}")
+    except Exception as e:
+        return HttpResponse(f"❌ Error: {e}")
