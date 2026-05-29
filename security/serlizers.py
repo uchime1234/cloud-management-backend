@@ -41,7 +41,7 @@ class PublicExposureReportSerializer(serializers.ModelSerializer):
 
 
 from rest_framework import serializers
-from .models import SecurityGroupAnalysis, SecurityGroupAuditLog
+from .models import SecurityGroupAnalysis
 
 class RiskFindingSerializer(serializers.Serializer):
     type = serializers.CharField()
