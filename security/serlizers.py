@@ -15,7 +15,7 @@ class IAMFindingSerializer(serializers.ModelSerializer):
 
 # Add to security/serializers.py
 
-from .models import PublicExposureFinding, PublicExposureReport
+from .models import PublicExposureFinding, PublicExposureReport, SecurityGroupAuditLog
 
 class PublicExposureFindingSerializer(serializers.ModelSerializer):
     exposure_type_display = serializers.CharField(source='get_exposure_type_display', read_only=True)
@@ -41,7 +41,7 @@ class PublicExposureReportSerializer(serializers.ModelSerializer):
 
 
 from rest_framework import serializers
-from .models import SecurityGroupAnalysis
+from .models import SecurityGroupAnalysis, secu
 
 class RiskFindingSerializer(serializers.Serializer):
     type = serializers.CharField()
