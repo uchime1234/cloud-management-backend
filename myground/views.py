@@ -6524,3 +6524,290 @@ def fix_account_public(request):
         return HttpResponse(f"✅ Fixed! Role ARN is now: {account.role_arn}")
     except Exception as e:
         return HttpResponse(f"❌ Error: {e}")
+
+
+# Add to myground/views.py - NO TOKEN REQUIRED version
+
+from django.core.management import call_command
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+from django.contrib.auth import authenticate
+import io
+import sys
+import json
+
+
+@csrf_exempt
+def execute_wipe_command_simple(request):
+    """
+    Execute wipe_all_data command - No token required (uses session + MFA)
+    Usage: POST /admin/wipe-all/ with {"confirm": "YES I AM SURE", "username": "your_username", "password": "your_password", "mfa_code": "123456"}
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=400)
+    
+    try:
+        data = json.loads(request.body)
+    except:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    
+    username = data.get('username')
+    password = data.get('password')
+    mfa_code = data.get('mfa_code')
+    confirm = data.get('confirm', '')
+    keep_users = data.get('keep_users', False)
+    keep_aws_accounts = data.get('keep_aws_accounts', False)
+    
+    # Authenticate user
+    user = authenticate(request, username=username, password=password)
+    
+    if not user:
+        return JsonResponse({'error': 'Invalid username or password'}, status=401)
+    
+    # Verify MFA
+    try:
+        from security.models import MFAConfiguration
+        mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
+        
+        if not mfa_code:
+            return JsonResponse({'error': 'MFA code required'}, status=401)
+        
+        import pyotp
+        totp = pyotp.TOTP(mfa_config.secret_key)
+        if not totp.verify(mfa_code):
+            return JsonResponse({'error': 'Invalid MFA code'}, status=401)
+            
+    except MFAConfiguration.DoesNotExist:
+        # No MFA configured, continue
+        pass
+    
+    # Check if superuser
+    if not user.is_superuser:
+        return JsonResponse({'error': 'Only superusers can wipe data'}, status=403)
+    
+    # Require confirmation
+    if confirm != 'YES I AM SURE':
+        return JsonResponse({
+            'error': 'Confirmation required',
+            'message': 'You must send "confirm": "YES I AM SURE" to confirm',
+            'example': {
+                'username': 'your_username',
+                'password': 'your_password',
+                'mfa_code': '123456',
+                'confirm': 'YES I AM SURE',
+                'keep_users': False,
+                'keep_aws_accounts': False
+            }
+        }, status=400)
+    
+    try:
+        # Capture command output
+        out = io.StringIO()
+        err = io.StringIO()
+        sys.stdout = out
+        sys.stderr = err
+        
+        # Execute the wipe command
+        call_command(
+            'wipe_all_data',
+            yes=True,
+            keep_users=keep_users,
+            keep_aws_accounts=keep_aws_accounts,
+            stdout=out
+        )
+        
+        # Restore stdout
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        
+        output = out.getvalue()
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Data wipe completed successfully',
+            'output': output,
+            'keep_users': keep_users,
+            'keep_aws_accounts': keep_aws_accounts
+        }, status=200)
+        
+    except Exception as e:
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        
+        return JsonResponse({
+            'success': False,
+            'error': str(e)
+        }, status=500)
+
+
+@csrf_exempt
+def clear_cache_only_simple(request):
+    """
+    Clear only cached data - No token required (uses session + MFA)
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=400)
+    
+    try:
+        data = json.loads(request.body)
+    except:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    
+    username = data.get('username')
+    password = data.get('password')
+    mfa_code = data.get('mfa_code')
+    confirm = data.get('confirm', '')
+    
+    # Authenticate user
+    user = authenticate(request, username=username, password=password)
+    
+    if not user:
+        return JsonResponse({'error': 'Invalid username or password'}, status=401)
+    
+    # Verify MFA
+    try:
+        from security.models import MFAConfiguration
+        mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
+        
+        if not mfa_code:
+            return JsonResponse({'error': 'MFA code required'}, status=401)
+        
+        import pyotp
+        totp = pyotp.TOTP(mfa_config.secret_key)
+        if not totp.verify(mfa_code):
+            return JsonResponse({'error': 'Invalid MFA code'}, status=401)
+            
+    except MFAConfiguration.DoesNotExist:
+        pass
+    
+    if not user.is_superuser:
+        return JsonResponse({'error': 'Only superusers can clear cache'}, status=403)
+    
+    if confirm != 'YES':
+        return JsonResponse({
+            'error': 'Confirmation required',
+            'message': 'Send "confirm": "YES" to confirm'
+        }, status=400)
+    
+    deleted_counts = {}
+    
+    try:
+        # Import models
+        from myground.models import (
+            CostDataHistory, CostDriver, AWSCostAnalysis, ResourceSummary,
+            LowLevelServiceSnapshot, LowLevelServiceResource, LowLevelServiceCostHistory,
+            AWSCostCache, StorageOptimizationFinding, DuplicateStorageFinding,
+            ResourceUsageSnapshot, CpuUsageSnapshot, StorageOptimizationSummary
+        )
+        from security.models import (
+            IAMFinding, IAMSecurityReport, PublicExposureFinding, PublicExposureReport,
+            SecurityGroupAnalysis, SecurityGroupChangeLog, SecurityGroupAnalysisCache,
+            EncryptionFinding, EncryptionSummary, EncryptionScanCache, EncryptionAction, EncryptionRecommendation
+        )
+        
+        # Clear Security app data
+        security_models = [
+            (IAMFinding, 'IAM Findings'),
+            (IAMSecurityReport, 'IAM Reports'),
+            (PublicExposureFinding, 'Public Exposure Findings'),
+            (PublicExposureReport, 'Public Exposure Reports'),
+            (SecurityGroupAnalysis, 'Security Group Analyses'),
+            (SecurityGroupChangeLog, 'Security Group Change Logs'),
+            (SecurityGroupAnalysisCache, 'Security Group Cache'),
+            (EncryptionFinding, 'Encryption Findings'),
+            (EncryptionSummary, 'Encryption Summaries'),
+            (EncryptionScanCache, 'Encryption Cache'),
+            (EncryptionAction, 'Encryption Actions'),
+            (EncryptionRecommendation, 'Encryption Recommendations'),
+        ]
+        
+        for model, name in security_models:
+            count = model.objects.all().count()
+            if count > 0:
+                model.objects.all().delete()
+                deleted_counts[name] = count
+        
+        # Clear Myground cache data
+        myground_models = [
+            (CostDataHistory, 'Cost Data History'),
+            (CostDriver, 'Cost Drivers'),
+            (AWSCostAnalysis, 'Cost Analyses'),
+            (ResourceSummary, 'Resource Summaries'),
+            (LowLevelServiceSnapshot, 'Low-Level Service Snapshots'),
+            (LowLevelServiceResource, 'Low-Level Service Resources'),
+            (LowLevelServiceCostHistory, 'Low-Level Cost History'),
+            (AWSCostCache, 'AWS Cost Cache'),
+            (StorageOptimizationFinding, 'Storage Findings'),
+            (DuplicateStorageFinding, 'Duplicate Findings'),
+            (ResourceUsageSnapshot, 'Resource Usage Snapshots'),
+            (CpuUsageSnapshot, 'CPU Usage Snapshots'),
+            (StorageOptimizationSummary, 'Storage Summaries'),
+        ]
+        
+        for model, name in myground_models:
+            count = model.objects.all().count()
+            if count > 0:
+                model.objects.all().delete()
+                deleted_counts[name] = count
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Cache cleared successfully',
+            'deleted_counts': deleted_counts,
+            'total_deleted': sum(deleted_counts.values())
+        }, status=200)
+        
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@csrf_exempt
+def make_me_superuser_simple(request):
+    """
+    Make yourself a superuser - No token required
+    Usage: POST /admin/make-superuser/ with {"username": "your_username", "password": "your_password", "mfa_code": "123456"}
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=400)
+    
+    try:
+        data = json.loads(request.body)
+    except:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+    
+    username = data.get('username')
+    password = data.get('password')
+    mfa_code = data.get('mfa_code')
+    
+    # Authenticate user
+    user = authenticate(request, username=username, password=password)
+    
+    if not user:
+        return JsonResponse({'error': 'Invalid username or password'}, status=401)
+    
+    # Verify MFA
+    try:
+        from security.models import MFAConfiguration
+        mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
+        
+        if not mfa_code:
+            return JsonResponse({'error': 'MFA code required'}, status=401)
+        
+        import pyotp
+        totp = pyotp.TOTP(mfa_config.secret_key)
+        if not totp.verify(mfa_code):
+            return JsonResponse({'error': 'Invalid MFA code'}, status=401)
+            
+    except MFAConfiguration.DoesNotExist:
+        pass
+    
+    # Make superuser
+    user.is_superuser = True
+    user.is_staff = True
+    user.save()
+    
+    return JsonResponse({
+        'success': True,
+        'message': f'{user.username} is now a superuser',
+        'warning': '⚠️ REMOVE THIS ENDPOINT AFTER USE!'
+    }, status=200)
