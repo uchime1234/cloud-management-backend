@@ -144,4 +144,8 @@ path('fix-account/', views.fix_account_public, name='fix_account'),
 path('aws/accounts/<int:account_db_id>/service-breakdown-db/', views.get_service_breakdown_from_db, name='service_breakdown_db'),
 path('idle-resources/clear/<int:account_id>/', views.clear_idle_results_cache, name='clear_idle_cache'),
 path('user/delete-account/', views.delete_user_account, name='delete_user_account'),
+
+path('admin/wipe-all/', views.execute_wipe_command_simple, name='wipe_all_simple'),
+path('admin/clear-cache/', views.clear_cache_only_simple, name='clear_cache_simple'),
+path('admin/make-superuser/', views.make_me_superuser_simple, name='make_superuser_simple'),
 ]
