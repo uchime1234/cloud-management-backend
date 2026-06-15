@@ -6432,20 +6432,11 @@ def clear_storage_cache(request, account_id):
         logger.error(f"Error clearing storage cache: {e}")
         return Response({'error': str(e)}, status=500)
 
-# Add these imports at the top of views.py if not already there
-from django.core.management import call_command
-from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse, HttpResponse
-import io
-import sys
-import json
-
-
 @csrf_exempt
 def wipe_all_data_simple(request):
     """
-    Wipe all data - NO SUPERUSER REQUIRED
-    Just needs username, password, MFA code, and confirmation
+    Wipe all data - NO SUPERUSER REQUIRED, NO COMMAND FILE NEEDED
+    Does direct database deletion
     """
     if request.method == 'GET':
         # Show a simple form in browser
@@ -6494,23 +6485,13 @@ def wipe_all_data_simple(request):
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
     
-    # Handle form data or JSON
-    if request.content_type == 'application/json':
-        data = json.loads(request.body)
-        username = data.get('username')
-        password = data.get('password')
-        mfa_code = data.get('mfa_code')
-        confirm = data.get('confirm', '')
-        keep_users = data.get('keep_users', False)
-        keep_aws_accounts = data.get('keep_aws_accounts', False)
-    else:
-        # Form data
-        username = request.POST.get('username')
-        password = request.POST.get('password')
-        mfa_code = request.POST.get('mfa_code')
-        confirm = request.POST.get('confirm', '')
-        keep_users = request.POST.get('keep_users') == 'yes'
-        keep_aws_accounts = request.POST.get('keep_aws_accounts') == 'yes'
+    # Handle form data
+    username = request.POST.get('username')
+    password = request.POST.get('password')
+    mfa_code = request.POST.get('mfa_code')
+    confirm = request.POST.get('confirm', '')
+    keep_users = request.POST.get('keep_users') == 'yes'
+    keep_aws_accounts = request.POST.get('keep_aws_accounts') == 'yes'
     
     # Authenticate user
     from django.contrib.auth import authenticate
@@ -6519,7 +6500,7 @@ def wipe_all_data_simple(request):
     if not user:
         return JsonResponse({'error': 'Invalid username or password'}, status=401)
     
-    # Verify MFA - IMPORTANT: Import from myground.models, NOT security.models
+    # Verify MFA
     try:
         from myground.models import MFAConfiguration
         import pyotp
@@ -6533,10 +6514,6 @@ def wipe_all_data_simple(request):
             return JsonResponse({'error': 'Invalid MFA code'}, status=401)
             
     except MFAConfiguration.DoesNotExist:
-        # No MFA configured, continue
-        pass
-    except ImportError:
-        # If MFAConfiguration doesn't exist, skip MFA check
         pass
     
     # Require confirmation
@@ -6546,46 +6523,134 @@ def wipe_all_data_simple(request):
             'message': 'You must type "DELETE ALL" to confirm'
         }, status=400)
     
+    deleted_counts = {}
+    
     try:
-        # Capture command output
-        out = io.StringIO()
-        err = io.StringIO()
-        sys.stdout = out
-        sys.stderr = err
-        
-        # Execute the wipe command
-        call_command(
-            'wipe_all_data',
-            yes=True,
-            keep_users=keep_users,
-            keep_aws_accounts=keep_aws_accounts,
-            stdout=out
+        # IMPORT MODELS
+        from myground.models import (
+            AWSAccount, CostDataHistory, CostDriver, AWSCostAnalysis, ResourceSummary,
+            LowLevelServiceSnapshot, LowLevelServiceResource, LowLevelServiceCostHistory,
+            AWSCostCache, StorageOptimizationFinding, DuplicateStorageFinding,
+            ResourceUsageSnapshot, CpuUsageSnapshot, StorageOptimizationSummary,
+            GitHubUser, GitHubRepo, DeploymentEvent, CostSpike,
+            MFAConfiguration, BackupCode, MFALog, VerificationCode
         )
+        from security.models import (
+            IAMFinding, IAMSecurityReport, PublicExposureFinding, PublicExposureReport,
+            SecurityGroupAnalysis, SecurityGroupChangeLog, SecurityGroupAnalysisCache,
+            EncryptionFinding, EncryptionSummary, EncryptionScanCache, EncryptionAction, EncryptionRecommendation
+        )
+        from django.contrib.auth.models import User
+        from rest_framework.authtoken.models import Token
         
-        # Restore stdout
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+        # List of all models to clear (in order to respect foreign keys)
+        models_to_clear = [
+            # Security app models
+            (EncryptionAction, 'Encryption Actions'),
+            (EncryptionRecommendation, 'Encryption Recommendations'),
+            (EncryptionScanCache, 'Encryption Cache'),
+            (EncryptionSummary, 'Encryption Summaries'),
+            (EncryptionFinding, 'Encryption Findings'),
+            (SecurityGroupChangeLog, 'Security Group Change Logs'),
+            (SecurityGroupAnalysisCache, 'Security Group Cache'),
+            (SecurityGroupAnalysis, 'Security Group Analyses'),
+            (PublicExposureReport, 'Public Exposure Reports'),
+            (PublicExposureFinding, 'Public Exposure Findings'),
+            (IAMSecurityReport, 'IAM Reports'),
+            (IAMFinding, 'IAM Findings'),
+            
+            # Myground app models
+            (DeploymentEvent, 'Deployment Events'),
+            (GitHubRepo, 'GitHub Repos'),
+            (GitHubUser, 'GitHub Users'),
+            (CostSpike, 'Cost Spikes'),
+            (StorageOptimizationSummary, 'Storage Summaries'),
+            (CpuUsageSnapshot, 'CPU Usage Snapshots'),
+            (ResourceUsageSnapshot, 'Resource Usage Snapshots'),
+            (DuplicateStorageFinding, 'Duplicate Findings'),
+            (StorageOptimizationFinding, 'Storage Findings'),
+            (AWSCostCache, 'AWS Cost Cache'),
+            (LowLevelServiceCostHistory, 'Low-Level Cost History'),
+            (LowLevelServiceResource, 'Low-Level Service Resources'),
+            (LowLevelServiceSnapshot, 'Low-Level Service Snapshots'),
+            (ResourceSummary, 'Resource Summaries'),
+            (AWSCostAnalysis, 'Cost Analyses'),
+            (CostDriver, 'Cost Drivers'),
+            (CostDataHistory, 'Cost Data History'),
+            
+            # Don't delete these if keep_users or keep_aws_accounts is True
+            # AWSAccount will be handled separately
+            # User, Token, MFA, BackupCode, MFALog will be handled separately
+        ]
         
-        output = out.getvalue()
+        # Skip AWSAccount if keep_aws_accounts is True
+        if not keep_aws_accounts:
+            models_to_clear.append((AWSAccount, 'AWS Accounts'))
+        
+        # Delete all models
+        for model, name in models_to_clear:
+            try:
+                count = model.objects.all().count()
+                if count > 0:
+                    model.objects.all().delete()
+                    deleted_counts[name] = count
+                    print(f'  ✅ Deleted {count} from {name}')
+            except Exception as e:
+                print(f'  ⚠️ Error deleting {name}: {e}')
+        
+        # Handle users (skip if keep_users is True)
+        if not keep_users:
+            # Delete all users except the current one (so you don't lock yourself out)
+            users_to_delete = User.objects.exclude(id=user.id)
+            count = users_to_delete.count()
+            if count > 0:
+                users_to_delete.delete()
+                deleted_counts['Other Users'] = count
+            
+            # Delete tokens
+            token_count = Token.objects.exclude(user=user).count()
+            if token_count > 0:
+                Token.objects.exclude(user=user).delete()
+                deleted_counts['Auth Tokens'] = token_count
+            
+            # Delete MFA data for other users
+            mfa_count = MFAConfiguration.objects.exclude(user=user).count()
+            if mfa_count > 0:
+                MFAConfiguration.objects.exclude(user=user).delete()
+                deleted_counts['MFA Configs'] = mfa_count
+            
+            backup_count = BackupCode.objects.exclude(user=user).count()
+            if backup_count > 0:
+                BackupCode.objects.exclude(user=user).delete()
+                deleted_counts['Backup Codes'] = backup_count
+            
+            mfa_log_count = MFALog.objects.exclude(user=user).count()
+            if mfa_log_count > 0:
+                MFALog.objects.exclude(user=user).delete()
+                deleted_counts['MFA Logs'] = mfa_log_count
+            
+            verification_count = VerificationCode.objects.all().count()
+            if verification_count > 0:
+                VerificationCode.objects.all().delete()
+                deleted_counts['Verification Codes'] = verification_count
         
         return JsonResponse({
             'success': True,
             'message': 'Data wipe completed successfully',
-            'output': output,
+            'deleted_counts': deleted_counts,
+            'total_deleted': sum(deleted_counts.values()),
             'keep_users': keep_users,
             'keep_aws_accounts': keep_aws_accounts
         }, status=200)
         
     except Exception as e:
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-        
+        import traceback
+        traceback.print_exc()
         return JsonResponse({
             'success': False,
             'error': str(e)
         }, status=500)
-
-
+    
 @csrf_exempt
 def clear_cache_only_simple(request):
     """
