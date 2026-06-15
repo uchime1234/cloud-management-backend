@@ -6432,133 +6432,88 @@ def clear_storage_cache(request, account_id):
         logger.error(f"Error clearing storage cache: {e}")
         return Response({'error': str(e)}, status=500)
 
-# Add this function to your views.py
-
-@api_view(['DELETE'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def delete_user_account(request):
-    """
-    Permanently delete user account and all associated data
-    """
-    try:
-        user = request.user
-        username = user.username
-        email = user.email
-        
-        logger.warning(f"⚠️ Account deletion requested for user: {username} ({email})")
-        
-        # Delete all associated data
-        # The cascade will handle related models if set up correctly
-        # But we'll explicitly delete major associations for safety
-        
-        # Delete AWS accounts and related data
-        from .models import AWSAccount, CostDataHistory, CostDriver, AWSCostAnalysis, ResourceSummary
-        from .models import LowLevelServiceSnapshot, LowLevelServiceResource, LowLevelServiceCostHistory
-        
-        # Delete AWS accounts (this will cascade to many related models)
-        aws_accounts_deleted = AWSAccount.objects.filter(user=user).delete()[0]
-        
-        # Delete GitHub connections
-        from .models import GitHubUser, GitHubRepo, DeploymentEvent
-        github_user_deleted = GitHubUser.objects.filter(user=user).delete()[0]
-        github_repos_deleted = GitHubRepo.objects.filter(user=user).delete()[0]
-        deployments_deleted = DeploymentEvent.objects.filter(repo__user=user).delete()[0]
-        
-        # Delete any remaining orphaned data
-        CostDataHistory.objects.filter(aws_account__user=user).delete()
-        CostDriver.objects.filter(aws_account__user=user).delete()
-        AWSCostAnalysis.objects.filter(aws_account__user=user).delete()
-        ResourceSummary.objects.filter(account__user=user).delete()
-        LowLevelServiceSnapshot.objects.filter(account__user=user).delete()
-        LowLevelServiceResource.objects.filter(account__user=user).delete()
-        LowLevelServiceCostHistory.objects.filter(account__user=user).delete()
-        
-        # Delete MFA configurations
-        from .models import MFAConfiguration, BackupCode, MFALog
-        MFAConfiguration.objects.filter(user=user).delete()
-        BackupCode.objects.filter(user=user).delete()
-        MFALog.objects.filter(user=user).delete()
-        
-        # Delete verification codes
-        VerificationCode.objects.filter(email=email).delete()
-        
-        # Delete auth tokens
-        Token.objects.filter(user=user).delete()
-        
-        # Finally delete the user
-        user.delete()
-        
-        logger.info(f"✅ Account permanently deleted: {username} ({email})")
-        
-        return Response({
-            'success': True,
-            'message': 'Your account has been permanently deleted. All data has been removed.',
-            'deleted_counts': {
-                'aws_accounts': aws_accounts_deleted,
-                'github_data': github_user_deleted + github_repos_deleted,
-                'deployments': deployments_deleted
-            }
-        }, status=200)
-        
-    except Exception as e:
-        logger.error(f"Error deleting user account: {e}")
-        return Response({
-            'success': False,
-            'error': f'Failed to delete account: {str(e)}'
-        }, status=500)
-
-# TEMPORARY - REMOVE AFTER USE
-def fix_account_public(request):
-    from myground.models import AWSAccount
-    from django.contrib.auth.models import User
-    
-    try:
-        user = User.objects.get(username='uchimevictor_12')
-        account = AWSAccount.objects.get(user=user, account_id='769793000661')
-        
-        account.role_arn = 'arn:aws:iam::769793000661:role/CloudCostReadOnlyRole'
-        account.status = 'connected'
-        account.save()
-        
-        return HttpResponse(f"✅ Fixed! Role ARN is now: {account.role_arn}")
-    except Exception as e:
-        return HttpResponse(f"❌ Error: {e}")
-
-
-# Add to myground/views.py - NO TOKEN REQUIRED version
-
+# Add these imports at the top of views.py if not already there
 from django.core.management import call_command
 from django.views.decorators.csrf import csrf_exempt
 from django.http import JsonResponse
-from django.contrib.auth import authenticate
 import io
 import sys
 import json
 
 
 @csrf_exempt
-def execute_wipe_command_simple(request):
+def wipe_all_data_simple(request):
     """
-    Execute wipe_all_data command - No token required (uses session + MFA)
-    Usage: POST /admin/wipe-all/ with {"confirm": "YES I AM SURE", "username": "your_username", "password": "your_password", "mfa_code": "123456"}
+    Wipe all data - NO SUPERUSER REQUIRED
+    Just needs username, password, MFA code, and confirmation
     """
+    if request.method == 'GET':
+        # Show a simple form in browser
+        return HttpResponse("""
+        <html>
+        <head>
+            <title>Wipe All Data</title>
+            <style>
+                body { font-family: Arial; padding: 20px; max-width: 500px; margin: auto; }
+                input, button { padding: 10px; margin: 5px; width: 100%; }
+                .danger { background-color: #ff4444; color: white; border: none; }
+                .warning { background-color: #ffaa00; padding: 10px; margin-bottom: 20px; }
+            </style>
+        </head>
+        <body>
+            <h1>⚠️ DANGER: Wipe All Data</h1>
+            <div class="warning">
+                <strong>WARNING:</strong> This will delete ALL data from the database!<br>
+                This action cannot be undone!
+            </div>
+            <form method="POST">
+                <label>Username:</label>
+                <input type="text" name="username" value="uchimevictor_12" required>
+                
+                <label>Password:</label>
+                <input type="password" name="password" required>
+                
+                <label>MFA Code:</label>
+                <input type="text" name="mfa_code" placeholder="Enter your authenticator code" required>
+                
+                <label>Type "DELETE ALL" to confirm:</label>
+                <input type="text" name="confirm" placeholder="DELETE ALL" required>
+                
+                <label>Keep users? (leave unchecked to delete everything)</label>
+                <input type="checkbox" name="keep_users" value="yes">
+                
+                <label>Keep AWS accounts?</label>
+                <input type="checkbox" name="keep_aws_accounts" value="yes">
+                
+                <button type="submit" class="danger">🗑️ DELETE ALL DATA</button>
+            </form>
+        </body>
+        </html>
+        """)
+    
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
     
-    try:
+    # Handle form data or JSON
+    if request.content_type == 'application/json':
         data = json.loads(request.body)
-    except:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    username = data.get('username')
-    password = data.get('password')
-    mfa_code = data.get('mfa_code')
-    confirm = data.get('confirm', '')
-    keep_users = data.get('keep_users', False)
-    keep_aws_accounts = data.get('keep_aws_accounts', False)
+        username = data.get('username')
+        password = data.get('password')
+        mfa_code = data.get('mfa_code')
+        confirm = data.get('confirm', '')
+        keep_users = data.get('keep_users', False)
+        keep_aws_accounts = data.get('keep_aws_accounts', False)
+    else:
+        # Form data
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        mfa_code = request.POST.get('mfa_code')
+        confirm = request.POST.get('confirm', '')
+        keep_users = request.POST.get('keep_users') == 'yes'
+        keep_aws_accounts = request.POST.get('keep_aws_accounts') == 'yes'
     
     # Authenticate user
+    from django.contrib.auth import authenticate
     user = authenticate(request, username=username, password=password)
     
     if not user:
@@ -6567,12 +6522,12 @@ def execute_wipe_command_simple(request):
     # Verify MFA
     try:
         from security.models import MFAConfiguration
+        import pyotp
         mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
         
         if not mfa_code:
             return JsonResponse({'error': 'MFA code required'}, status=401)
         
-        import pyotp
         totp = pyotp.TOTP(mfa_config.secret_key)
         if not totp.verify(mfa_code):
             return JsonResponse({'error': 'Invalid MFA code'}, status=401)
@@ -6581,23 +6536,11 @@ def execute_wipe_command_simple(request):
         # No MFA configured, continue
         pass
     
-    # Check if superuser
-    if not user.is_superuser:
-        return JsonResponse({'error': 'Only superusers can wipe data'}, status=403)
-    
     # Require confirmation
-    if confirm != 'YES I AM SURE':
+    if confirm != 'DELETE ALL':
         return JsonResponse({
             'error': 'Confirmation required',
-            'message': 'You must send "confirm": "YES I AM SURE" to confirm',
-            'example': {
-                'username': 'your_username',
-                'password': 'your_password',
-                'mfa_code': '123456',
-                'confirm': 'YES I AM SURE',
-                'keep_users': False,
-                'keep_aws_accounts': False
-            }
+            'message': 'You must type "DELETE ALL" to confirm'
         }, status=400)
     
     try:
@@ -6643,51 +6586,86 @@ def execute_wipe_command_simple(request):
 @csrf_exempt
 def clear_cache_only_simple(request):
     """
-    Clear only cached data - No token required (uses session + MFA)
+    Clear only cached data - NO SUPERUSER REQUIRED
+    Safer option - only deletes scan/cache data, preserves user accounts and AWS connections
     """
+    if request.method == 'GET':
+        return HttpResponse("""
+        <html>
+        <head>
+            <title>Clear Cache Only</title>
+            <style>
+                body { font-family: Arial; padding: 20px; max-width: 500px; margin: auto; }
+                input, button { padding: 10px; margin: 5px; width: 100%; }
+                .warning { background-color: #ffaa00; padding: 10px; margin-bottom: 20px; }
+                .safe { background-color: #4CAF50; color: white; border: none; }
+            </style>
+        </head>
+        <body>
+            <h1>🧹 Clear Cache Only</h1>
+            <div class="warning">
+                This will only clear scan/cache data.<br>
+                Your user accounts and AWS connections will be preserved!
+            </div>
+            <form method="POST">
+                <label>Username:</label>
+                <input type="text" name="username" value="uchimevictor_12" required>
+                
+                <label>Password:</label>
+                <input type="password" name="password" required>
+                
+                <label>MFA Code:</label>
+                <input type="text" name="mfa_code" placeholder="Enter your authenticator code" required>
+                
+                <label>Type "CLEAR" to confirm:</label>
+                <input type="text" name="confirm" placeholder="CLEAR" required>
+                
+                <button type="submit" class="safe">🧹 CLEAR CACHE</button>
+            </form>
+        </body>
+        </html>
+        """)
+    
     if request.method != 'POST':
         return JsonResponse({'error': 'POST required'}, status=400)
     
-    try:
+    # Handle form data or JSON
+    if request.content_type == 'application/json':
         data = json.loads(request.body)
-    except:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        username = data.get('username')
+        password = data.get('password')
+        mfa_code = data.get('mfa_code')
+        confirm = data.get('confirm', '')
+    else:
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        mfa_code = request.POST.get('mfa_code')
+        confirm = request.POST.get('confirm', '')
     
-    username = data.get('username')
-    password = data.get('password')
-    mfa_code = data.get('mfa_code')
-    confirm = data.get('confirm', '')
-    
-    # Authenticate user
+    # Authenticate
+    from django.contrib.auth import authenticate
     user = authenticate(request, username=username, password=password)
     
     if not user:
-        return JsonResponse({'error': 'Invalid username or password'}, status=401)
+        return JsonResponse({'error': 'Invalid credentials'}, status=401)
     
     # Verify MFA
     try:
         from security.models import MFAConfiguration
+        import pyotp
         mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
         
         if not mfa_code:
             return JsonResponse({'error': 'MFA code required'}, status=401)
         
-        import pyotp
         totp = pyotp.TOTP(mfa_config.secret_key)
         if not totp.verify(mfa_code):
             return JsonResponse({'error': 'Invalid MFA code'}, status=401)
-            
     except MFAConfiguration.DoesNotExist:
         pass
     
-    if not user.is_superuser:
-        return JsonResponse({'error': 'Only superusers can clear cache'}, status=403)
-    
-    if confirm != 'YES':
-        return JsonResponse({
-            'error': 'Confirmation required',
-            'message': 'Send "confirm": "YES" to confirm'
-        }, status=400)
+    if confirm != 'CLEAR':
+        return JsonResponse({'error': 'Type "CLEAR" to confirm'}, status=400)
     
     deleted_counts = {}
     
@@ -6759,55 +6737,3 @@ def clear_cache_only_simple(request):
         
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
-
-
-@csrf_exempt
-def make_me_superuser_simple(request):
-    """
-    Make yourself a superuser - No token required
-    Usage: POST /admin/make-superuser/ with {"username": "your_username", "password": "your_password", "mfa_code": "123456"}
-    """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST required'}, status=400)
-    
-    try:
-        data = json.loads(request.body)
-    except:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
-    
-    username = data.get('username')
-    password = data.get('password')
-    mfa_code = data.get('mfa_code')
-    
-    # Authenticate user
-    user = authenticate(request, username=username, password=password)
-    
-    if not user:
-        return JsonResponse({'error': 'Invalid username or password'}, status=401)
-    
-    # Verify MFA
-    try:
-        from security.models import MFAConfiguration
-        mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
-        
-        if not mfa_code:
-            return JsonResponse({'error': 'MFA code required'}, status=401)
-        
-        import pyotp
-        totp = pyotp.TOTP(mfa_config.secret_key)
-        if not totp.verify(mfa_code):
-            return JsonResponse({'error': 'Invalid MFA code'}, status=401)
-            
-    except MFAConfiguration.DoesNotExist:
-        pass
-    
-    # Make superuser
-    user.is_superuser = True
-    user.is_staff = True
-    user.save()
-    
-    return JsonResponse({
-        'success': True,
-        'message': f'{user.username} is now a superuser',
-        'warning': '⚠️ REMOVE THIS ENDPOINT AFTER USE!'
-    }, status=200)
