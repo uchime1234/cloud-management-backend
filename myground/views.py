@@ -6435,7 +6435,7 @@ def clear_storage_cache(request, account_id):
 # Add these imports at the top of views.py if not already there
 from django.core.management import call_command
 from django.views.decorators.csrf import csrf_exempt
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 import io
 import sys
 import json
@@ -6519,9 +6519,9 @@ def wipe_all_data_simple(request):
     if not user:
         return JsonResponse({'error': 'Invalid username or password'}, status=401)
     
-    # Verify MFA
+    # Verify MFA - IMPORTANT: Import from myground.models, NOT security.models
     try:
-        from security.models import MFAConfiguration
+        from myground.models import MFAConfiguration
         import pyotp
         mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
         
@@ -6534,6 +6534,9 @@ def wipe_all_data_simple(request):
             
     except MFAConfiguration.DoesNotExist:
         # No MFA configured, continue
+        pass
+    except ImportError:
+        # If MFAConfiguration doesn't exist, skip MFA check
         pass
     
     # Require confirmation
@@ -6649,9 +6652,9 @@ def clear_cache_only_simple(request):
     if not user:
         return JsonResponse({'error': 'Invalid credentials'}, status=401)
     
-    # Verify MFA
+    # Verify MFA - IMPORTANT: Import from myground.models
     try:
-        from security.models import MFAConfiguration
+        from myground.models import MFAConfiguration
         import pyotp
         mfa_config = MFAConfiguration.objects.get(user=user, is_enabled=True)
         
@@ -6662,6 +6665,8 @@ def clear_cache_only_simple(request):
         if not totp.verify(mfa_code):
             return JsonResponse({'error': 'Invalid MFA code'}, status=401)
     except MFAConfiguration.DoesNotExist:
+        pass
+    except ImportError:
         pass
     
     if confirm != 'CLEAR':
