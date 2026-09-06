@@ -171,15 +171,19 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # ============================================================
-# EMAIL CONFIGURATION - SENDGRID WEB API
+# EMAIL CONFIGURATION - RESEND WEB API
 # ============================================================
-EMAIL_BACKEND = "sendgrid_backend.SendgridBackend"
-SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL')
-SENDGRID_SANITIZE_HTML = True
-SENDGRID_TRACK_CLICKS = False
-SENDGRID_TRACK_OPENS = False
-SENDGRID_SANDBOX_MODE_IN_DEBUG = False
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY')
+ADMIN_EMAIL = "uchimevictor797@gmail.com"
+DEFAULT_FROM_EMAIL = ADMIN_EMAIL
+
+# Email Backend - Use Resend's API
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.resend.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'resend'
+EMAIL_HOST_PASSWORD = RESEND_API_KEY
 
 # REST Framework settings
 REST_FRAMEWORK = {

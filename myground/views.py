@@ -107,22 +107,23 @@ def register_user(request):
         serializer = UserSerializer(users, many=True)  # Serialize the queryset
         return Response(serializer.data)  # Now this is correct!
     
+# myground/views.py - Updated send_verification_code
 
 def send_verification_code(email):
-    """Helper function to send verification code"""
+    """Helper function to send verification code using Resend"""
     # Generate a 6-digit code
     code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
     
-    # Save the code (without creating a user yet)
+    # Save the code
     verification_code, created = VerificationCode.objects.update_or_create(
-        email=email,  # We use email as identifier since user doesn't exist yet
+        email=email,
         defaults={'code': code, 'is_used': False}
     )
     
-    # Send email (using Django's built-in email backend)
+    # Send email using Resend (SMTP method)
     subject = 'Your Account Verification Code'
-    message = f'Your verification code is: {code}'
-    email_from = settings.EMAIL_HOST_USER
+    message = f'Your verification code is: {code}\n\nThis code expires in 15 minutes.'
+    email_from = settings.DEFAULT_FROM_EMAIL
     recipient_list = [email]
     
     try:
@@ -674,19 +675,15 @@ def regenerate_backup_codes(request):
         return Response({"error": "MFA is not enabled"},
                        status=status.HTTP_400_BAD_REQUEST)
 
-
+# myground/views.py - Updated password_reset_request
 
 @api_view(['POST'])
 def password_reset_request(request):
-    """
-    Step 1: Send a 6-digit reset code to the user's email.
-    Accepts: { "email": "user@example.com" }
-    """
+    """Step 1: Send a 6-digit reset code to the user's email."""
     email = request.data.get('email')
     if not email:
         return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Always return success to prevent user enumeration
     if not User.objects.filter(email=email).exists():
         return Response({
             "message": "If an account with that email exists, a reset code has been sent."
@@ -695,7 +692,6 @@ def password_reset_request(request):
     # Generate 6-digit code
     code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
 
-    # Reuse VerificationCode model — store by email, mark unused
     VerificationCode.objects.update_or_create(
         email=email,
         defaults={'code': code, 'is_used': False}
@@ -707,7 +703,7 @@ def password_reset_request(request):
         f'Your reset code is: {code}\n\n'
         f'This code expires in 15 minutes. If you did not request this, ignore this email.'
     )
-    email_from = settings.EMAIL_HOST_USER
+    email_from = settings.DEFAULT_FROM_EMAIL
 
     try:
         send_mail(subject, message, email_from, [email])
@@ -720,7 +716,6 @@ def password_reset_request(request):
     return Response({
         "message": "If an account with that email exists, a reset code has been sent."
     }, status=status.HTTP_200_OK)
-
 
 @api_view(['POST'])
 def password_reset_verify(request):
