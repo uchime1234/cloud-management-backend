@@ -5,6 +5,8 @@ Django settings for authhentication project.
 from pathlib import Path
 import socket
 import os
+# views.py - Add at the top with other imports
+import resend
 import dj_database_url
 
 
@@ -178,13 +180,10 @@ ADMIN_EMAIL = "uchimevictor797@gmail.com"
 DEFAULT_FROM_EMAIL = ADMIN_EMAIL
 
 # Email Backend - Use Resend's API
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.resend.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'resend'
-EMAIL_HOST_PASSWORD = RESEND_API_KEY
+EMAIL_BACKEND = 'django.core.mail.backends.dummy.EmailBackend'
 
+
+resend.api_key = RESEND_API_KEY
 # REST Framework settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [

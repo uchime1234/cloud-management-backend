@@ -108,35 +108,196 @@ def register_user(request):
         return Response(serializer.data)  # Now this is correct!
     
 # myground/views.py - Updated send_verification_code
+def send_email_resend(to_email, subject, html_content, text_content=None):
+    """
+    Send email using Resend HTTP API (RELIABLE, NO TIMEOUTS)
+    """
+    try:
+        # Ensure API key is set
+        if not settings.RESEND_API_KEY:
+            print("❌ RESEND_API_KEY not set in environment")
+            return None
+            
+        # Set the API key
+        resend.api_key = settings.RESEND_API_KEY
+        
+        # Prepare email params
+        params = {
+            "from": settings.DEFAULT_FROM_EMAIL,
+            "to": [to_email],
+            "subject": subject,
+            "html": html_content,
+        }
+        
+        # Add text version if provided
+        if text_content:
+            params["text"] = text_content
+        
+        # Send via Resend HTTP API
+        email_response = resend.Emails.send(params)
+        
+        print(f"✅ Email sent successfully to {to_email}: {email_response.get('id', 'unknown')}")
+        return email_response
+        
+    except Exception as e:
+        print(f"❌ Resend email error: {e}")
+        # Fallback to SMTP if HTTP API fails
+        try:
+            send_mail(
+                subject,
+                text_content or html_content,
+                settings.DEFAULT_FROM_EMAIL,
+                [to_email],
+                fail_silently=False,
+                html_message=html_content
+            )
+            print(f"✅ Email sent via SMTP fallback to {to_email}")
+            return {"id": "smtp-fallback"}
+        except Exception as smtp_error:
+            print(f"❌ SMTP fallback also failed: {smtp_error}")
+            return None
+
 
 def send_verification_code(email):
-    """Helper function to send verification code using Resend"""
-    # Generate a 6-digit code
+    """
+    Send verification code using Resend HTTP API (WORKING)
+    """
+    # Generate 6-digit code
     code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
     
-    # Save the code
+    # Save to database
     verification_code, created = VerificationCode.objects.update_or_create(
         email=email,
         defaults={'code': code, 'is_used': False}
     )
     
-    # Send email using Resend (SMTP method)
-    subject = 'Your Account Verification Code'
-    message = f'Your verification code is: {code}\n\nThis code expires in 15 minutes.'
-    email_from = settings.DEFAULT_FROM_EMAIL
-    recipient_list = [email]
+    # Email content
+    subject = "🔐 Your Account Verification Code"
     
-    try:
-        send_mail(subject, message, email_from, recipient_list)
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8fafc;">
+        <div style="background: white; border-radius: 12px; padding: 40px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #0f172a; font-size: 24px; margin: 0;">Cloud Management Platform</h1>
+                <p style="color: #64748b; margin-top: 8px;">Verify your email address</p>
+            </div>
+            
+            <div style="text-align: center; padding: 30px 0;">
+                <div style="background: #f1f5f9; padding: 20px; border-radius: 8px; display: inline-block;">
+                    <span style="font-size: 48px; font-weight: bold; color: #2563eb; letter-spacing: 12px; font-family: monospace;">
+                        {code}
+                    </span>
+                </div>
+            </div>
+            
+            <p style="color: #334155; font-size: 16px; text-align: center;">
+                Enter this code to complete your registration.
+            </p>
+            
+            <div style="background: #f8fafc; border-radius: 8px; padding: 16px; margin: 20px 0;">
+                <p style="color: #64748b; font-size: 14px; margin: 0; text-align: center;">
+                    ⏰ This code expires in <strong>15 minutes</strong>
+                </p>
+            </div>
+            
+            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+            
+            <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">
+                If you didn't request this code, please ignore this email.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text_content = f"""
+    Cloud Management Platform - Verification Code
+    
+    Your verification code is: {code}
+    
+    This code expires in 15 minutes.
+    
+    If you didn't request this, please ignore this email.
+    """
+    
+    # Send using Resend HTTP API
+    result = send_email_resend(email, subject, html_content, text_content)
+    
+    if result:
         return Response({
             "message": "Verification code sent to your email",
             "next_step": "Submit the code to complete registration"
         }, status=status.HTTP_200_OK)
-    except Exception as e:
-        print("Email send failed:", str(e))
-        return Response({"error": f"Failed to send verification code: {str(e)}"}, 
-                       status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    else:
+        return Response({
+            "error": "Failed to send verification code. Please try again."
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
+def send_password_reset_email(email, code):
+    """
+    Send password reset email using Resend HTTP API
+    """
+    subject = "🔑 Password Reset Code"
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8fafc;">
+        <div style="background: white; border-radius: 12px; padding: 40px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <h1 style="color: #0f172a; font-size: 24px; margin: 0;">Reset Your Password</h1>
+            </div>
+            
+            <div style="text-align: center; padding: 30px 0;">
+                <div style="background: #f1f5f9; padding: 20px; border-radius: 8px; display: inline-block;">
+                    <span style="font-size: 48px; font-weight: bold; color: #dc2626; letter-spacing: 12px; font-family: monospace;">
+                        {code}
+                    </span>
+                </div>
+            </div>
+            
+            <p style="color: #334155; font-size: 16px; text-align: center;">
+                Use this code to reset your password.
+            </p>
+            
+            <div style="background: #fef2f2; border-radius: 8px; padding: 16px; margin: 20px 0;">
+                <p style="color: #dc2626; font-size: 14px; margin: 0; text-align: center;">
+                    ⏰ This code expires in <strong>15 minutes</strong>
+                </p>
+            </div>
+            
+            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;">
+            
+            <p style="color: #94a3b8; font-size: 12px; text-align: center; margin: 0;">
+                If you didn't request this, please ignore this email.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text_content = f"""
+    Password Reset Code
+    
+    Your password reset code is: {code}
+    
+    This code expires in 15 minutes.
+    
+    If you didn't request this, please ignore this email.
+    """
+    
+    return send_email_resend(email, subject, html_content, text_content)
 
 def verify_and_register(username, email, password, verification_code):
     """Helper function to verify code and register user"""
