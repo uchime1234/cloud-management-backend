@@ -176,7 +176,7 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # EMAIL CONFIGURATION - RESEND WEB API
 # ============================================================
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY')
-ADMIN_EMAIL = "uchimevictor797@gmail.com"
+ADMIN_EMAIL = "onboarding@resend.dev"
 DEFAULT_FROM_EMAIL = ADMIN_EMAIL
 
 # Email Backend - Use Resend's API
