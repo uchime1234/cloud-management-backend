@@ -1,82 +1,113 @@
-from django.shortcuts import render
-from django.shortcuts import redirect
-from django.http import HttpResponse
+# ============================================================
+# ALL IMPORTS - MUST BE AT THE VERY TOP
+# ============================================================
+
+from django.shortcuts import render, redirect
+from django.http import HttpResponse, JsonResponse
 from django.contrib import messages
-from .low_level_db_service import LowLevelServiceDB
-from django.views.decorators.http import require_http_methods
-from django.views.decorators.csrf import csrf_exempt
-from django.contrib.auth.models import User, auth
-from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate, get_user_model
-from django.conf import settings
-from rest_framework.permissions import AllowAny
-from rest_framework import status
-import requests
-import base64
-from django.core.mail import send_mail
-import random
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from django.http import JsonResponse
-from rest_framework import status
-from django.views.decorators.http import require_GET
-from rest_framework.decorators import api_view, permission_classes, authentication_classes
-from rest_framework.authentication import TokenAuthentication, SessionAuthentication
-from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth.models import User, auth
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods, require_GET
+from django.utils.decorators import method_decorator
 from django.utils import timezone
-from datetime import datetime, timedelta
-from decimal import Decimal
-import boto3
+from django.conf import settings
+from django.core.cache import cache
+from django.core.mail import send_mail
 from django.db import transaction
+from django.http import JsonResponse
+
+# REST Framework
+from rest_framework import status, viewsets, generics
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
+from rest_framework.authentication import TokenAuthentication, SessionAuthentication
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.authtoken.models import Token
+
+# Python Standard Library
+import os
+import json
+import uuid
+import random
 import time
 import threading
-import json
-# from .serializers import AWSAccountConnectionSerializer, CostAnalyticsSerializer, ResourceSummarySerializer
-from .models import VerificationCode, MFAConfiguration, BackupCode, MFALog, CostDriver, AWSCostCache  # AWSAccountConnection, MonthlyCostSummary, DailySpend, RecentDailySpend, ResourceSummary, LowLevelServiceSnapshot, LowLevelServiceCategory, LowLevelServiceCostHistory, LowLevelServiceDefinition, LowLevelServiceResource 
-import uuid
-import os
-from django.conf import settings
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
-from django.core.cache import cache
-# Add this at the very top of views.py with your other imports
 import logging
+import base64
+import ssl
+from datetime import datetime, timedelta
+from decimal import Decimal
+from statistics import mean
 
-# Create logger instance
-import logging
-logger = logging.getLogger(__name__)
+# Third-party imports
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+import pyotp
+import requests
+import resend  # ✅ IMPORTANT: resend must be here!
+import urllib3
 
-# AWS Client imports
-from .aws_client import assume_role
-
-# # Tasks imports
-# from .tasks import (
-#     fetch_aws_costs, update_monthly_summary, 
-#     update_cost_forecast, update_recent_daily_spend
-# )
-# At the top of views.py with other imports, add:
-
-# Serializers imports
+# Local imports
+from .low_level_db_service import LowLevelServiceDB
+from .models import (
+    VerificationCode, MFAConfiguration, BackupCode, MFALog, CostDriver,
+    AWSCostCache, AWSAccount, GitHubRepo, DeploymentEvent, CostSpike,
+    GitHubUser, AWSCostAnalysis, LowLevelServiceSnapshot, LowLevelServiceCategory,
+    LowLevelServiceCostHistory, LowLevelServiceDefinition, LowLevelServiceResource
+)
 from .serializers import UserSerializer
-
-# MFA Utils imports
 from .utils.mfa_utils import (
-    generate_secret_key, 
-    generate_qr_code, 
+    generate_secret_key,
+    generate_qr_code,
     generate_backup_codes,
     verify_totp_code,
     check_rate_limit
 )
+from .aws_client import assume_role, test_connection
+from .aws_cost import (
+    get_cached_90_days_cost, get_cached_monthly_cost,
+    get_cached_7_days_cost, get_cached_yesterday_cost,
+    get_cached_cost_drivers, get_cached_low_level_costs,
+    get_cached_cost_analysis, save_cost_data, clear_cost_data,
+    generate_cost_analysis
+)
+from .github_service import (
+    GitHubService, exchange_code_for_token,
+    get_user_from_token, sync_repo_deployments
+)
+from .terraform_parser import TerraformCostEstimator
+from .forecast_service import CostForecastEngine
+from .storage_optimization_service import (
+    test_ebs_volumes, test_elastic_ips, test_rds_instances,
+    test_snapshots, test_unattached_ebs_volumes_only,
+    test_duplicate_snapshots, test_idle_rds_instances,
+    test_unused_amis, save_scan_results_to_db,
+    get_cached_scan_results, get_cached_storage_results,
+    clear_all_storage_data
+)
+from .idle_resources import (
+    check_idle_ec2_instances, check_idle_auto_scaling_groups,
+    check_idle_load_balancers, check_idle_lambda_functions,
+    check_idle_ecs_services, check_idle_nat_gateways,
+    check_idle_vpc_endpoints, check_idle_api_gateways,
+    check_idle_cloudwatch_resources, get_cached_idle_results,
+    clear_all_idle_data
+)
+from .low_level_tracker import discover_low_level_services
 
-# # Resource tracker imports
-# from .resource_tracker import get_aws_resources, get_resource_usage_summary
+# Create logger instance
+logger = logging.getLogger(__name__)
 
-# Rest Framework imports
-from rest_framework import viewsets, generics
-from rest_framework.decorators import action
+# Disable SSL warnings (development only)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Create your views here.
+# ============================================================
+# NOW YOUR VIEW FUNCTIONS GO HERE
+# ============================================================
+
+
 
 @api_view(["GET", 'POST'])
 def register_user(request):
