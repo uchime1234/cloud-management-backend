@@ -1357,3 +1357,97 @@ class IdleCloudWatchMetric(models.Model):
         ordering = ['-detected_at']
 
 
+# myground/models.py - Add at the bottom
+
+class ResourceAIAnalysis(models.Model):
+    """
+    Stores resource data + AI recommendation together.
+    Cached forever until user clears it.
+    """
+    
+    VERDICT_CHOICES = [
+        ('LEAVE_IT', 'Leave It'),
+        ('MONITOR_IT', 'Monitor It'),
+        ('SCHEDULE_IT', 'Schedule It'),
+        ('DOWNSIZE_IT', 'Downsize It'),
+        ('STOP_IT', 'Stop It'),
+        ('TERMINATE_IT', 'Terminate It'),
+    ]
+    
+    RISK_CHOICES = [
+        ('ZERO', 'Zero Risk'),
+        ('LOW', 'Low Risk'),
+        ('MEDIUM', 'Medium Risk'),
+        ('HIGH', 'High Risk'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('ON', 'On'),
+        ('OFF', 'Off'),
+        ('STOPPED', 'Stopped'),
+        ('UNKNOWN', 'Unknown'),
+    ]
+    
+    # Ownership
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='resource_ai_analyses')
+    aws_account = models.ForeignKey(AWSAccount, on_delete=models.CASCADE, related_name='resource_ai_analyses')
+    
+    # Service grouping
+    service_category = models.CharField(max_length=100, default='Other')  # e.g., "Compute", "Database", "Storage"
+    service_name = models.CharField(max_length=100)  # e.g., "EC2", "RDS", "S3"
+    
+    # Resource identity
+    resource_id = models.CharField(max_length=500)  # e.g., "i-abc123"
+    resource_name = models.CharField(max_length=500, blank=True)
+    resource_type = models.CharField(max_length=100)  # e.g., "t2.micro", "db.m5.large"
+    region = models.CharField(max_length=50, blank=True)
+    tags = models.JSONField(default=dict, blank=True)
+    
+    # Status
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='UNKNOWN')
+    on_since = models.DateTimeField(null=True, blank=True)
+    last_checked = models.DateTimeField(null=True, blank=True)
+    
+    # Metrics
+    cpu_avg = models.FloatField(default=0)
+    memory_avg = models.FloatField(null=True, blank=True)
+    network_in_mb = models.FloatField(default=0)
+    network_out_mb = models.FloatField(default=0)
+    disk_read_mb = models.FloatField(default=0)
+    disk_write_mb = models.FloatField(default=0)
+    
+    # Cost
+    monthly_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    
+    # AI Analysis
+    ai_verdict = models.CharField(max_length=20, choices=VERDICT_CHOICES, default='MONITOR_IT')
+    ai_short_reason = models.CharField(max_length=500, blank=True)
+    ai_detailed_explanation = models.TextField(blank=True)
+    ai_savings_monthly = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    ai_savings_yearly = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    ai_risk = models.CharField(max_length=20, choices=RISK_CHOICES, default='LOW')
+    ai_steps = models.JSONField(default=list, blank=True)
+    ai_alternatives = models.JSONField(default=list, blank=True)
+    ai_time_to_fix = models.CharField(max_length=100, blank=True)
+    ai_one_click_available = models.BooleanField(default=False)
+    ai_priority = models.IntegerField(default=5)
+    
+    # Extra
+    resource_details = models.JSONField(default=dict, blank=True)
+    
+    # Metadata
+    ai_generated_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-ai_priority', '-ai_savings_monthly']
+        unique_together = ('aws_account', 'resource_id')
+        indexes = [
+            models.Index(fields=['aws_account', 'service_name']),
+            models.Index(fields=['aws_account', 'ai_verdict']),
+            models.Index(fields=['aws_account', 'service_category']),
+        ]
+    
+    def __str__(self):
+        return f"{self.service_name}: {self.resource_id} - {self.ai_verdict}"

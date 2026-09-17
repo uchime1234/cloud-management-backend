@@ -2716,241 +2716,6 @@ def get_low_level_services_summary(request, account_id):
         return JsonResponse({'error': str(e)}, status=500)
 
 
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def get_paid_resources(request, account_id):
-    """Get paid resources breakdown - FIXED VERSION"""
-    try:
-        account = AWSAccount.objects.get(id=account_id, user=request.user)
-        
-        # Get low-level data directly from database
-        from .models import LowLevelServiceResource, LowLevelServiceDefinition
-        
-        # Get all active resources
-        resources = LowLevelServiceResource.objects.filter(
-            account=account,
-            is_active=True
-        ).select_related('service_definition__category')
-        
-        if not resources.exists():
-            # Return sample data for testing if no real data exists
-            return Response({
-                'cost_categories': {},
-                'summary': {
-                    'total_paid_resources': 0,
-                    'high_cost_resources': 0,
-                    'medium_cost_resources': 0,
-                    'low_cost_resources': 0,
-                    'categories_found': 0,
-                    'timestamp': timezone.now().isoformat()
-                },
-                'message': 'No resource data available yet. Please sync your AWS account first.'
-            }, status=200)
-        
-        # Define cost thresholds
-        HIGH_COST_THRESHOLD = 50
-        MEDIUM_COST_THRESHOLD = 10
-        
-        # Process resources into categories
-        cost_categories = {}
-        total_resources_count = 0
-        high_count = 0
-        medium_count = 0
-        low_count = 0
-        
-        for resource in resources:
-            service_def = resource.service_definition
-            category_name = service_def.category.name if service_def.category else 'Other'
-            amount = float(resource.estimated_monthly_cost or 0)
-            resource_name = service_def.name
-            resource_id = resource.resource_id
-            region = resource.region or 'N/A'
-            
-            total_resources_count += 1
-            
-            # Determine cost level for this resource
-            if amount >= HIGH_COST_THRESHOLD:
-                high_count += 1
-                cost_level = 'HIGH'
-            elif amount >= MEDIUM_COST_THRESHOLD:
-                medium_count += 1
-                cost_level = 'MEDIUM'
-            else:
-                low_count += 1
-                cost_level = 'LOW'
-            
-            # Create category key
-            category_key = category_name.lower().replace(' ', '_').replace('&', '')
-            
-            if category_key not in cost_categories:
-                cost_categories[category_key] = {
-                    'name': category_name,
-                    'description': f'Resources in the {category_name} category',
-                    'cost_level': cost_level,
-                    'cost_driver': resource_name[:50] if amount >= HIGH_COST_THRESHOLD else 'Minor contributor',
-                    'resources': [],
-                    'count': 0,
-                    'estimated_monthly_cost': 0
-                }
-            
-            # Add resource to category
-            cost_categories[category_key]['resources'].append({
-                'name': resource_name,
-                'resource_id': resource_id,
-                'region': region,
-                'amount': round(amount, 2),
-                'cost_level': cost_level
-            })
-            cost_categories[category_key]['count'] += 1
-            cost_categories[category_key]['estimated_monthly_cost'] += amount
-            
-            # Update category cost level based on total
-            if cost_categories[category_key]['estimated_monthly_cost'] >= HIGH_COST_THRESHOLD:
-                cost_categories[category_key]['cost_level'] = 'HIGH'
-            elif cost_categories[category_key]['estimated_monthly_cost'] >= MEDIUM_COST_THRESHOLD:
-                cost_categories[category_key]['cost_level'] = 'MEDIUM'
-            else:
-                cost_categories[category_key]['cost_level'] = 'LOW'
-        
-        # Calculate summary
-        summary = {
-            'total_paid_resources': total_resources_count,
-            'high_cost_resources': high_count,
-            'medium_cost_resources': medium_count,
-            'low_cost_resources': low_count,
-            'categories_found': len(cost_categories),
-            'timestamp': timezone.now().isoformat()
-        }
-        
-        return Response({
-            'cost_categories': cost_categories,
-            'summary': summary,
-            'raw_resources': [{
-                'name': r.service_definition.name,
-                'amount': float(r.estimated_monthly_cost or 0),
-                'resource_id': r.resource_id,
-                'region': r.region
-            } for r in resources[:20]]
-        }, status=200)
-        
-    except AWSAccount.DoesNotExist:
-        return Response({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error getting paid resources: {e}")
-        return Response({'error': str(e)}, status=500)
-
-
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def get_resource_summary(request, account_id):
-    """Get resource summary for the account - FIXED VERSION"""
-    try:
-        account = AWSAccount.objects.get(id=account_id, user=request.user)
-        
-        # Get resources from database with proper filtering
-        from .models import LowLevelServiceResource, LowLevelServiceDefinition
-        
-        resources = LowLevelServiceResource.objects.filter(
-            account=account,
-            is_active=True
-        ).select_related('service_definition__category')
-        
-        # Initialize summary with all possible services
-        resource_summary = {
-            'total_resources': 0,
-            'total_monthly_cost': 0,
-            'services': {}
-        }
-        
-        # Service name mappings for display
-        service_mappings = {
-            'ec2': {'display': 'EC2 Instances', 'icon': 'Cpu', 'category': 'Compute'},
-            'instance': {'display': 'EC2 Instances', 'icon': 'Cpu', 'category': 'Compute'},
-            'lambda': {'display': 'Lambda Functions', 'icon': 'Code', 'category': 'Compute'},
-            'eks': {'display': 'EKS Clusters', 'icon': 'Container', 'category': 'Compute'},
-            'ecs': {'display': 'ECS Services', 'icon': 'Container', 'category': 'Compute'},
-            'rds': {'display': 'RDS Instances', 'icon': 'Database', 'category': 'Database'},
-            'database': {'display': 'RDS Instances', 'icon': 'Database', 'category': 'Database'},
-            'dynamodb': {'display': 'DynamoDB Tables', 'icon': 'Box', 'category': 'Database'},
-            'elasticache': {'display': 'ElastiCache Clusters', 'icon': 'Zap', 'category': 'Database'},
-            'redshift': {'display': 'Redshift Clusters', 'icon': 'Sparkles', 'category': 'Database'},
-            's3': {'display': 'S3 Buckets', 'icon': 'HardDrive', 'category': 'Storage'},
-            'bucket': {'display': 'S3 Buckets', 'icon': 'HardDrive', 'category': 'Storage'},
-            'ebs': {'display': 'EBS Volumes', 'icon': 'HardDrive', 'category': 'Storage'},
-            'volume': {'display': 'EBS Volumes', 'icon': 'HardDrive', 'category': 'Storage'},
-            'efs': {'display': 'EFS File Systems', 'icon': 'FileText', 'category': 'Storage'},
-            'load balancer': {'display': 'Load Balancers', 'icon': 'Scale', 'category': 'Networking'},
-            'alb': {'display': 'Load Balancers', 'icon': 'Scale', 'category': 'Networking'},
-            'elb': {'display': 'Load Balancers', 'icon': 'Scale', 'category': 'Networking'},
-            'nat': {'display': 'NAT Gateways', 'icon': 'Network', 'category': 'Networking'},
-            'vpc': {'display': 'VPC Resources', 'icon': 'Network', 'category': 'Networking'},
-            'endpoint': {'display': 'VPC Endpoints', 'icon': 'Key', 'category': 'Networking'},
-            'cloudfront': {'display': 'CloudFront Distributions', 'icon': 'Globe', 'category': 'CDN'},
-            'api gateway': {'display': 'API Gateway', 'icon': 'Settings', 'category': 'Integration'},
-            'sqs': {'display': 'SQS Queues', 'icon': 'MessageSquare', 'category': 'Messaging'},
-            'sns': {'display': 'SNS Topics', 'icon': 'Bell', 'category': 'Messaging'},
-            'route53': {'display': 'Route53 Zones', 'icon': 'Globe', 'category': 'DNS'},
-            'cloudwatch': {'display': 'CloudWatch Resources', 'icon': 'Eye', 'category': 'Monitoring'},
-        }
-        
-        # Count resources
-        for resource in resources:
-            service_name = resource.service_definition.name.lower()
-            monthly_cost = float(resource.estimated_monthly_cost or 0)
-            
-            resource_summary['total_resources'] += resource.count or 1
-            resource_summary['total_monthly_cost'] += monthly_cost * (resource.count or 1)
-            
-            # Find matching service key
-            matched_key = None
-            for key, mapping in service_mappings.items():
-                if key in service_name:
-                    matched_key = key
-                    break
-            
-            if not matched_key:
-                matched_key = 'other'
-                if 'other' not in service_mappings:
-                    service_mappings['other'] = {'display': 'Other Resources', 'icon': 'Server', 'category': 'Other'}
-            
-            display_name = service_mappings[matched_key]['display']
-            
-            if display_name not in resource_summary['services']:
-                resource_summary['services'][display_name] = {
-                    'count': 0,
-                    'monthly_cost': 0,
-                    'icon': service_mappings[matched_key]['icon'],
-                    'category': service_mappings[matched_key]['category'],
-                    'resources': []
-                }
-            
-            resource_summary['services'][display_name]['count'] += resource.count or 1
-            resource_summary['services'][display_name]['monthly_cost'] += monthly_cost * (resource.count or 1)
-            resource_summary['services'][display_name]['resources'].append({
-                'id': resource.resource_id,
-                'name': resource.resource_name or resource.resource_id,
-                'region': resource.region,
-                'monthly_cost': monthly_cost
-            })
-        
-        # Sort services by monthly cost
-        sorted_services = dict(sorted(
-            resource_summary['services'].items(),
-            key=lambda x: x[1]['monthly_cost'],
-            reverse=True
-        ))
-        resource_summary['services'] = sorted_services
-        
-        return Response(resource_summary, status=200)
-        
-    except AWSAccount.DoesNotExist:
-        return Response({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error getting resource summary: {e}")
-        return Response({'error': str(e)}, status=500)
-
 
 @login_required
 def get_cost_analysis(request, account_id):
@@ -6128,93 +5893,6 @@ def clear_idle_results_cache(request, account_id):
         return Response({'error': str(e)}, status=500)
 
 
-
-
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def get_service_breakdown_from_db(request, account_db_id):
-    """
-    Get service breakdown directly from low-level services database
-    This will be more accurate than AWS Cost Explorer
-    """
-    try:
-        account = AWSAccount.objects.get(id=account_db_id, user=request.user)
-        
-        from .models import LowLevelServiceResource, LowLevelServiceDefinition
-        
-        # Get all active resources
-        resources = LowLevelServiceResource.objects.filter(
-            account=account,
-            is_active=True
-        ).select_related('service_definition')
-        
-        # Group by service category
-        service_costs = {}
-        
-        for resource in resources:
-            service_name = resource.service_definition.category.name if resource.service_definition.category else 'Other'
-            amount = float(resource.estimated_monthly_cost or 0) * (resource.count or 1)
-            
-            if amount > 0.50:  # Only include services costing more than $0.50
-                if service_name not in service_costs:
-                    service_costs[service_name] = {
-                        'service': service_name,
-                        'amount': 0,
-                        'count': 0,
-                        'resources': []
-                    }
-                service_costs[service_name]['amount'] += amount
-                service_costs[service_name]['count'] += 1
-                service_costs[service_name]['resources'].append({
-                    'name': resource.service_definition.name,
-                    'resource_id': resource.resource_id,
-                    'monthly_cost': amount
-                })
-        
-        # Calculate total
-        total = sum(data['amount'] for data in service_costs.values())
-        
-        # Build response
-        service_breakdown = []
-        for service_name, data in service_costs.items():
-            service_breakdown.append({
-                'service': service_name,
-                'amount': round(data['amount'], 2),
-                'percentage': round((data['amount'] / total) * 100, 1) if total > 0 else 0,
-                'resource_count': data['count'],
-                'recommendation': get_recommendation_for_service(service_name)
-            })
-        
-        # Sort by amount descending
-        service_breakdown.sort(key=lambda x: x['amount'], reverse=True)
-        
-        return Response({
-            'service_breakdown': service_breakdown[:10],
-            'total_monthly': round(total, 2),
-            'source': 'low_level_services_database'
-        }, status=200)
-        
-    except AWSAccount.DoesNotExist:
-        return Response({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error getting service breakdown from DB: {e}")
-        return Response({'error': str(e)}, status=500)
-
-def get_recommendation_for_service(service_name):
-    """Get recommendation based on service category"""
-    recommendations = {
-        'Virtual Private Cloud': 'Review NAT Gateways and VPC Endpoints for optimization',
-        'Elastic Compute Cloud': 'Check for idle EC2 instances and consider rightsizing',
-        'Relational Database Service': 'Review RDS instances for idle databases',
-        'Simple Storage Service': 'Implement lifecycle policies for S3 buckets',
-        'CloudFront': 'Optimize CloudFront distribution settings',
-        'Lambda': 'Review Lambda function memory settings and invocation patterns',
-        'DynamoDB': 'Consider using DynamoDB auto-scaling',
-        'Elastic Load Balancing': 'Check for idle load balancers',
-    }
-    return recommendations.get(service_name, 'Review resource utilization and optimize where possible')
-
 # Add this to views.py
 from django.core.cache import cache
 
@@ -6994,3 +6672,65 @@ def clear_cache_only_simple(request):
         
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
+
+
+# myground/views.py - Add these new views
+
+from .service_breakdown_service import generate_breakdown
+from .models import ResourceAIAnalysis
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def get_service_resource_breakdown(request, account_db_id):
+    """
+    Main endpoint for the new Service & Resource Breakdown feature.
+    Query params:
+      - force_refresh=true → rescan AWS + regenerate AI
+      - force_refresh=false (default) → use cached data
+    """
+    try:
+        account = AWSAccount.objects.get(
+            id=account_db_id,
+            user=request.user,
+            status='connected'
+        )
+        
+        force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
+        
+        result = generate_breakdown(account, force_refresh=force_refresh)
+        
+        if 'error' in result:
+            return Response({'error': result['error']}, status=500)
+        
+        return Response(result, status=200)
+        
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Breakdown error: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response({'error': str(e)}, status=500)
+
+
+@api_view(['DELETE'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def clear_service_resource_breakdown(request, account_db_id):
+    """Clear all cached breakdown data for this account."""
+    try:
+        account = AWSAccount.objects.get(id=account_db_id, user=request.user)
+        deleted_count, _ = ResourceAIAnalysis.objects.filter(aws_account=account).delete()
+        
+        return Response({
+            'success': True,
+            'message': f'Cleared {deleted_count} resources',
+            'deleted_count': deleted_count
+        }, status=200)
+        
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+    except Exception as e:
+        return Response({'error': str(e)}, status=500)
