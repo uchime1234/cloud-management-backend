@@ -6734,3 +6734,284 @@ def clear_service_resource_breakdown(request, account_db_id):
         return Response({'error': 'AWS account not found'}, status=404)
     except Exception as e:
         return Response({'error': str(e)}, status=500)
+
+# myground/views.py — Add at the end of the file
+
+from datetime import timedelta
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def resource_action(request, account_db_id, resource_id):
+    """
+    Handle Fix Now / Schedule / Dismiss actions on a ResourceAIAnalysis item.
+
+    Body (JSON):
+      action: "fix" | "schedule" | "dismiss"
+      schedule_start: ISO8601 (optional, required for "schedule")
+      schedule_end:   ISO8601 (optional, required for "schedule")
+    """
+    try:
+        account = AWSAccount.objects.get(
+            id=account_db_id, user=request.user, status='connected'
+        )
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+
+    try:
+        resource = ResourceAIAnalysis.objects.get(
+            aws_account=account, resource_id=resource_id
+        )
+    except ResourceAIAnalysis.DoesNotExist:
+        return Response({'error': 'Resource not found'}, status=404)
+
+    action = (request.data.get('action') or '').lower()
+
+    if action not in ('fix', 'schedule', 'dismiss'):
+        return Response(
+            {'error': 'action must be one of: fix, schedule, dismiss'},
+            status=400
+        )
+
+    # ============================================================
+    # DISMISS — mark the finding as dismissed and drop it from future responses
+    # ============================================================
+    if action == 'dismiss':
+        resource.ai_verdict = 'LEAVE_IT'
+        resource.ai_short_reason = 'Dismissed by user'
+        resource.ai_detailed_explanation = ''
+        resource.ai_savings_monthly = 0
+        resource.ai_savings_yearly = 0
+        resource.ai_priority = 1
+        resource.ai_one_click_available = False
+        resource.save()
+
+        return Response({
+            'success': True,
+            'action': 'dismiss',
+            'message': f'Dismissed {resource_id}',
+            'resource_id': resource_id,
+        }, status=200)
+
+    # ============================================================
+    # SCHEDULE — record the intended schedule in resource_details
+    # ============================================================
+    if action == 'schedule':
+        schedule_start = request.data.get('schedule_start')
+        schedule_end = request.data.get('schedule_end')
+
+        if not schedule_start or not schedule_end:
+            return Response(
+                {'error': 'schedule_start and schedule_end are required'},
+                status=400
+            )
+
+        details = resource.resource_details or {}
+        details['schedule'] = {
+            'start': schedule_start,
+            'end': schedule_end,
+            'created_at': timezone.now().isoformat(),
+            'created_by': request.user.username,
+            'status': 'pending_apply',
+        }
+        resource.resource_details = details
+        resource.ai_verdict = 'SCHEDULE_IT'
+        resource.save()
+
+        return Response({
+            'success': True,
+            'action': 'schedule',
+            'message': f'Scheduled {resource_id}',
+            'resource_id': resource_id,
+            'schedule': details['schedule'],
+        }, status=200)
+
+    # ============================================================
+    # FIX — attempt the recommended action against AWS
+    # ============================================================
+    fix_result = _execute_resource_fix(account, resource, request.user)
+
+    if fix_result.get('success'):
+        # Update the cached resource record so subsequent loads reflect the fix
+        details = resource.resource_details or {}
+        details['last_fix'] = {
+            'action': fix_result.get('action_taken'),
+            'applied_at': timezone.now().isoformat(),
+            'applied_by': request.user.username,
+            'aws_response': fix_result.get('aws_response'),
+        }
+        resource.resource_details = details
+
+        # Recompute verdict: if the fix removed the risk, stop recommending
+        if fix_result.get('verdict_after'):
+            resource.ai_verdict = fix_result['verdict_after']
+            resource.ai_short_reason = fix_result.get('short_reason_after', '')
+            resource.ai_savings_monthly = 0
+            resource.ai_savings_yearly = 0
+            resource.ai_one_click_available = False
+            resource.ai_priority = 1
+
+        resource.save()
+
+        return Response({
+            'success': True,
+            'action': 'fix',
+            'message': fix_result.get('message', 'Fix applied'),
+            'resource_id': resource_id,
+            'action_taken': fix_result.get('action_taken'),
+            'aws_response': fix_result.get('aws_response'),
+        }, status=200)
+
+    return Response({
+        'success': False,
+        'action': 'fix',
+        'message': fix_result.get('message', 'Fix failed'),
+        'error': fix_result.get('error', 'Unknown error'),
+        'requires_manual': fix_result.get('requires_manual', False),
+        'manual_steps': fix_result.get('manual_steps', []),
+    }, status=400)
+
+
+def _execute_resource_fix(account, resource, user):
+    """
+    Dispatch the correct AWS action based on service_name + ai_verdict.
+    Returns a dict with success/message/action_taken/aws_response.
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    service = resource.service_name
+    resource_id = resource.resource_id
+    region = resource.region or 'us-east-1'
+    verdict = resource.ai_verdict
+
+    # Assume role once
+    try:
+        sts = boto3.client(
+            'sts',
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            region_name=settings.AWS_REGION,
+        )
+        creds = sts.assume_role(
+            RoleArn=account.role_arn,
+            RoleSessionName='ResourceFix',
+            ExternalId=str(account.external_id),
+        )['Credentials']
+    except ClientError as e:
+        return {
+            'success': False,
+            'error': f'Failed to assume role: {e}',
+            'message': 'Could not assume AWS role',
+        }
+
+    def client(name, reg=region):
+        return boto3.client(
+            name,
+            aws_access_key_id=creds['AccessKeyId'],
+            aws_secret_access_key=creds['SecretAccessKey'],
+            aws_session_token=creds['SessionToken'],
+            region_name=reg,
+        )
+
+    try:
+        # ---------------- EC2 ----------------
+        if service == 'EC2':
+            ec2 = client('ec2')
+            if verdict in ('STOP_IT', 'SCHEDULE_IT'):
+                ec2.stop_instances(InstanceIds=[resource_id])
+                return {
+                    'success': True,
+                    'action_taken': 'ec2:StopInstances',
+                    'aws_response': {'instance_id': resource_id, 'state': 'stopping'},
+                    'message': f'Stopping EC2 instance {resource_id}',
+                    'verdict_after': 'MONITOR_IT',
+                    'short_reason_after': 'Stopped — monitor for 7 days before terminating.',
+                }
+            if verdict == 'TERMINATE_IT':
+                ec2.terminate_instances(InstanceIds=[resource_id])
+                return {
+                    'success': True,
+                    'action_taken': 'ec2:TerminateInstances',
+                    'aws_response': {'instance_id': resource_id, 'state': 'shutting-down'},
+                    'message': f'Terminating EC2 instance {resource_id}',
+                    'verdict_after': 'TERMINATE_IT',
+                    'short_reason_after': 'Termination in progress.',
+                }
+            if verdict == 'DOWNSIZE_IT':
+                return {
+                    'success': False,
+                    'message': 'Downsizing requires a stop/start with a new instance type',
+                    'error': 'manual_required',
+                    'requires_manual': True,
+                    'manual_steps': [
+                        f'Stop instance {resource_id}',
+                        'Change instance type in console',
+                        'Start instance and verify',
+                    ],
+                }
+
+        # ---------------- RDS ----------------
+        if service == 'RDS':
+            rds = client('rds')
+            if verdict in ('STOP_IT', 'SCHEDULE_IT'):
+                rds.stop_db_instance(DBInstanceIdentifier=resource_id)
+                return {
+                    'success': True,
+                    'action_taken': 'rds:StopDBInstance',
+                    'aws_response': {'db_instance': resource_id, 'status': 'stopping'},
+                    'message': f'Stopping RDS instance {resource_id}',
+                    'verdict_after': 'MONITOR_IT',
+                    'short_reason_after': 'Stopped — monitor for 7 days before final decision.',
+                }
+
+        # ---------------- S3 ----------------
+        if service == 'S3':
+            # S3 fixes don't map cleanly to verdicts; leave for manual
+            return {
+                'success': False,
+                'message': 'S3 optimization needs manual review',
+                'error': 'manual_required',
+                'requires_manual': True,
+                'manual_steps': [
+                    'Review the bucket lifecycle policy',
+                    'Move cold data to Glacier/IA',
+                    'Consider Intelligent-Tiering',
+                ],
+            }
+
+        # ---------------- Lambda ----------------
+        if service == 'Lambda':
+            lam = client('lambda')
+            if verdict == 'TERMINATE_IT':
+                lam.delete_function(FunctionName=resource_id)
+                return {
+                    'success': True,
+                    'action_taken': 'lambda:DeleteFunction',
+                    'aws_response': {'function_name': resource_id},
+                    'message': f'Deleted Lambda function {resource_id}',
+                    'verdict_after': 'TERMINATE_IT',
+                    'short_reason_after': 'Function deleted.',
+                }
+
+        # Fallback: we don't know how to auto-fix this one
+        return {
+            'success': False,
+            'message': f'Auto-fix not available for {service} / {verdict}',
+            'error': 'unsupported',
+            'requires_manual': True,
+            'manual_steps': [resource.ai_detailed_explanation or 'Review the resource manually.'],
+        }
+
+    except ClientError as e:
+        return {
+            'success': False,
+            'message': f'AWS error: {e.response.get("Error", {}).get("Message", str(e))}',
+            'error': 'aws_error',
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'message': f'Unexpected error: {e}',
+            'error': 'unexpected',
+        }

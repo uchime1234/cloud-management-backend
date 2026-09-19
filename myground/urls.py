@@ -73,7 +73,10 @@ urlpatterns = [
     path('api/aws/accounts/<int:account_id>/low-level-services-fast/', views.get_low_level_services_fast, name='low_level_services_fast'),
     path('api/aws/accounts/<int:account_id>/low-level-services-refresh/', views.refresh_low_level_services, name='low_level_services_refresh'),
     path('api/aws/accounts/<int:account_id>/low-level-services-summary/', views.get_low_level_services_summary, name='low_level_services_summary'),
-    
+
+    # myground/urls.py — add inside urlpatterns
+
+path( 'aws/accounts/<int:account_db_id>/resources/<path:resource_id>/action/',views.resource_action, name='resource_action'),
     # ============================================================
     # OLD RESOURCE ENDPOINTS (DEPRECATED - REMOVE AFTER MIGRATION)
     # ============================================================

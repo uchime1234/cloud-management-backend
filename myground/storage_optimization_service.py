@@ -1,782 +1,47 @@
-# storage_optimization_service.py
-import boto3
-from datetime import datetime, timedelta
-from django.conf import settings
-from django.utils import timezone
-from django.db import transaction
-from decimal import Decimal
-import logging
-
-from myground.models import (
-    AWSAccount,
-    StorageOptimizationFinding,
-    DuplicateStorageFinding,
-    ResourceUsageSnapshot,
-    CpuUsageSnapshot,
-    StorageOptimizationSummary
-)
-
-logger = logging.getLogger(__name__)
-
-def assume_role_for_account(aws_account):
-    """Helper to assume role and return credentials"""
-    sts = boto3.client(
-        'sts',
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-        region_name=settings.AWS_REGION
-    )
-    response = sts.assume_role(
-        RoleArn=aws_account.role_arn,
-        RoleSessionName="StorageOptimizationScan",
-        ExternalId=str(aws_account.external_id)
-    )
-    return response["Credentials"]
-
-def save_scan_results_to_db(user, aws_account, scan_results):
-    """Save all scan results to database"""
-    from .models import (
-        StorageOptimizationFinding, DuplicateStorageFinding,
-        ResourceUsageSnapshot, CpuUsageSnapshot, StorageOptimizationSummary
-    )
-    
-    with transaction.atomic():
-        # Mark old findings as inactive (soft delete)
-        StorageOptimizationFinding.objects.filter(
-            aws_account=aws_account,
-            status='active'
-        ).update(status='resolved')
-        
-        # Save EBS volume findings
-        for vol in scan_results.get('ebs_volumes', {}).get('unattached_volumes', []):
-            StorageOptimizationFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                resource_type='ebs_volume',
-                resource_id=vol['volume_id'],
-                resource_name=f"EBS Volume {vol['volume_id']}",
-                region=vol.get('region', 'unknown'),
-                size_gb=vol.get('size_gb', 0),
-                estimated_monthly_cost=vol.get('monthly_cost', 0),
-                confidence_score=95,
-                reason="This EBS volume is not attached to any EC2 instance, meaning it's not being used but still incurring storage costs.",
-                recommendation=f"Delete this unattached volume to save ${vol.get('monthly_cost', 0)}/month. First verify you don't need the data, then you can delete it from the EC2 console.",
-                severity='high' if vol.get('monthly_cost', 0) > 50 else 'medium',
-                status='active',
-                metadata={
-                    'size_gb': vol.get('size_gb'),
-                    'volume_type': vol.get('volume_type'),
-                    'scan_timestamp': timezone.now().isoformat()
-                }
-            )
-        
-        # Save Elastic IP findings
-        for ip in scan_results.get('elastic_ips', {}).get('items', []):
-            is_associated = ip.get('is_associated', False)
-            if not is_associated:
-                StorageOptimizationFinding.objects.create(
-                    user=user,
-                    aws_account=aws_account,
-                    resource_type='elastic_ip',
-                    resource_id=ip.get('public_ip', 'unknown'),
-                    resource_name=f"Elastic IP {ip.get('public_ip', 'unknown')}",
-                    region='global',
-                    estimated_monthly_cost=3.65,  # ~$0.005 per hour * 730 hours
-                    confidence_score=100,
-                    reason="This Elastic IP is allocated but not associated with any resource. AWS charges for unattached Elastic IPs.",
-                    recommendation="Release this Elastic IP to stop incurring charges. If you need to keep it, associate it with an EC2 instance or NAT gateway.",
-                    severity='medium',
-                    status='active',
-                    metadata={
-                        'allocation_id': ip.get('allocation_id'),
-                        'domain': ip.get('domain')
-                    }
-                )
-        
-        # Save RDS idle instance findings
-        for rds in scan_results.get('idle_rds_instances', {}).get('items', []):
-            if rds.get('avg_cpu', 100) < 10:
-                StorageOptimizationFinding.objects.create(
-                    user=user,
-                    aws_account=aws_account,
-                    resource_type='rds_instance',
-                    resource_id=rds['instance_id'],
-                    resource_name=f"RDS {rds['instance_id']}",
-                    region=aws_account.account_id[:10],
-                    estimated_monthly_cost=rds.get('monthly_cost', 0),
-                    confidence_score=85,
-                    reason=f"This RDS instance has very low CPU utilization ({rds.get('avg_cpu', 0)}% average over 7 days), suggesting it's underutilized.",
-                    recommendation=f"Consider downsizing to a smaller instance class or using Aurora Serverless. Potential savings: ${rds.get('monthly_cost', 0)}/month.",
-                    severity='medium' if rds.get('monthly_cost', 0) > 30 else 'low',
-                    status='active',
-                    metadata={
-                        'instance_class': rds.get('instance_class'),
-                        'avg_cpu': rds.get('avg_cpu'),
-                        'storage_gb': rds.get('storage_gb')
-                    }
-                )
-        
-        # Save unused AMI findings
-        for ami in scan_results.get('unused_amis', {}).get('items', []):
-            StorageOptimizationFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                resource_type='unused_ami',
-                resource_id=ami['ami_id'],
-                resource_name=ami['name'],
-                region='global',
-                size_gb=ami.get('volume_size_gb', 0),
-                estimated_monthly_cost=ami.get('monthly_cost', 0),
-                confidence_score=90,
-                reason=f"This AMI is {ami.get('age_days', 0)} days old and not used by any running EC2 instance.",
-                recommendation=f"Deregister this unused AMI to save ${ami.get('monthly_cost', 0)}/month in EBS snapshot storage costs.",
-                severity='low',
-                status='active',
-                metadata={
-                    'age_days': ami.get('age_days'),
-                    'volume_size_gb': ami.get('volume_size_gb')
-                }
-            )
-        
-        # Save duplicate snapshot findings
-        for dup in scan_results.get('duplicate_snapshots', {}).get('items', []):
-            DuplicateStorageFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                duplicate_type='redundant_backup',
-                group_id=dup['volume_id'],
-                group_name=f"Snapshots for volume {dup['volume_id']}",
-                resources=dup.get('redundant_snapshots', []),
-                total_wasted_size_gb=dup.get('total_size_gb', 0),
-                estimated_savings=dup.get('monthly_cost', 0),
-                reason=f"You have {dup.get('total_snapshots', 0)} snapshots for this volume. Keeping more than 2-3 is usually redundant.",
-                recommendation=f"Delete {dup.get('redundant_count', 0)} old snapshots to save ${dup.get('monthly_cost', 0)}/month. Keep only the most recent 2-3 snapshots.",
-                status='active'
-            )
-        
-        # Save daily resource usage snapshot
-        today = timezone.now().date()
-        
-        # EBS snapshot
-        ResourceUsageSnapshot.objects.update_or_create(
-            user=user,
-            aws_account=aws_account,
-            service_name='ebs',
-            region='global',
-            snapshot_date=today,
-            defaults={
-                'usage_value': scan_results.get('ebs_volumes', {}).get('total', 0),
-                'unit': 'volumes',
-                'metadata': {
-                    'unattached': scan_results.get('ebs_volumes', {}).get('unattached', 0),
-                    'total_size_gb': sum(v.get('size_gb', 0) for v in scan_results.get('ebs_volumes', {}).get('unattached_volumes', []))
-                }
-            }
-        )
-        
-        # RDS snapshot
-        ResourceUsageSnapshot.objects.update_or_create(
-            user=user,
-            aws_account=aws_account,
-            service_name='rds',
-            region='global',
-            snapshot_date=today,
-            defaults={
-                'usage_value': scan_results.get('rds_instances', {}).get('total', 0),
-                'unit': 'instances',
-                'metadata': {
-                    'idle_count': scan_results.get('idle_rds_instances', {}).get('count', 0)
-                }
-            }
-        )
-        
-        # Snapshot storage snapshot
-        ResourceUsageSnapshot.objects.update_or_create(
-            user=user,
-            aws_account=aws_account,
-            service_name='snapshots',
-            region='global',
-            snapshot_date=today,
-            defaults={
-                'usage_value': scan_results.get('snapshots', {}).get('total', 0),
-                'unit': 'snapshots',
-                'metadata': {
-                    'old_snapshots': scan_results.get('snapshots', {}).get('old', 0)
-                }
-            }
-        )
-        
-        # Update summary
-        summary, _ = StorageOptimizationSummary.objects.update_or_create(
-            user=user,
-            aws_account=aws_account,
-            defaults={
-                'total_idle_resources': scan_results.get('total_findings', 0),
-                'total_estimated_waste': scan_results.get('total_potential_savings', 0),
-                'duplicate_candidates': scan_results.get('duplicate_snapshots', {}).get('count', 0),
-                'duplicate_savings': sum(d.get('monthly_cost', 0) for d in scan_results.get('duplicate_snapshots', {}).get('items', [])),
-                'idle_cpu_resources': scan_results.get('idle_rds_instances', {}).get('count', 0),
-                'cpu_savings': sum(r.get('monthly_cost', 0) for r in scan_results.get('idle_rds_instances', {}).get('items', [])),
-                'summary_data': {
-                    'ebs_unattached': scan_results.get('ebs_volumes', {}).get('unattached', 0),
-                    'elastic_ips_unused': scan_results.get('elastic_ips', {}).get('unused', 0),
-                    'old_snapshots': scan_results.get('snapshots', {}).get('old', 0),
-                    'unused_amis': scan_results.get('unused_amis', {}).get('count', 0),
-                    'duplicate_groups': scan_results.get('duplicate_snapshots', {}).get('count', 0)
-                }
-            }
-        )
-        
-        logger.info(f"Saved {StorageOptimizationFinding.objects.filter(aws_account=aws_account, status='active').count()} findings to database")
-    
-    return True
-
-def get_cached_scan_results(user, aws_account, force_refresh=False):
-    """Get cached scan results from database"""
-    from .models import StorageOptimizationFinding, DuplicateStorageFinding, StorageOptimizationSummary
-    
-    # Check if we have recent findings (less than 24 hours old)
-    recent_findings = StorageOptimizationFinding.objects.filter(
-        aws_account=aws_account,
-        status='active',
-        detected_at__gte=timezone.now() - timedelta(hours=24)
-    )
-    
-    if recent_findings.exists() and not force_refresh:
-        logger.info(f"Using cached findings: {recent_findings.count()} active findings")
-        
-        # Build response from database
-        summary = StorageOptimizationSummary.objects.filter(aws_account=aws_account).first()
-        
-        return {
-            'success': True,
-            'cached': True,
-            'total_findings': recent_findings.count(),
-            'total_potential_savings': float(summary.total_estimated_waste) if summary else 0,
-            'ebs_volumes': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='ebs',
-                    snapshot_date=timezone.now().date()
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='ebs').exists() else 0,
-                'unattached': recent_findings.filter(resource_type='ebs_volume').count(),
-                'unattached_volumes': [
-                    {
-                        'volume_id': f.resource_id,
-                        'size_gb': float(f.size_gb) if f.size_gb else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost),
-                        'region': f.region
-                    }
-                    for f in recent_findings.filter(resource_type='ebs_volume')
-                ],
-                'items': []
-            },
-            'idle_rds_instances': {
-                'count': recent_findings.filter(resource_type='rds_instance').count(),
-                'items': [
-                    {
-                        'instance_id': f.resource_id,
-                        'instance_class': f.metadata.get('instance_class', 'unknown'),
-                        'avg_cpu': f.metadata.get('avg_cpu', 0),
-                        'storage_gb': f.metadata.get('storage_gb', 0),
-                        'monthly_cost': float(f.estimated_monthly_cost)
-                    }
-                    for f in recent_findings.filter(resource_type='rds_instance')
-                ]
-            },
-            'elastic_ips': {
-                'total': ResourceUsageSnapshot.objects.filter(
-                    aws_account=aws_account,
-                    service_name='snapshots'
-                ).first().usage_value if ResourceUsageSnapshot.objects.filter(aws_account=aws_account, service_name='snapshots').exists() else 0,
-                'unused': recent_findings.filter(resource_type='elastic_ip').count(),
-                'items': []
-            },
-            'snapshots': {
-                'total': 0,
-                'old': recent_findings.filter(resource_type='ebs_snapshot').count(),
-                'items': []
-            },
-            'unused_amis': {
-                'count': recent_findings.filter(resource_type='unused_ami').count(),
-                'items': [
-                    {
-                        'ami_id': f.resource_id,
-                        'name': f.resource_name,
-                        'age_days': f.metadata.get('age_days', 0),
-                        'volume_size_gb': float(f.size_gb) if f.size_gb else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost)
-                    }
-                    for f in recent_findings.filter(resource_type='unused_ami')
-                ]
-            },
-            'duplicate_snapshots': {
-                'count': DuplicateStorageFinding.objects.filter(aws_account=aws_account, status='active').count(),
-                'items': [
-                    {
-                        'volume_id': d.group_id,
-                        'total_snapshots': len(d.resources) + 2,
-                        'redundant_count': len(d.resources),
-                        'total_size_gb': float(d.total_wasted_size_gb) if d.total_wasted_size_gb else 0,
-                        'monthly_cost': float(d.estimated_savings)
-                    }
-                    for d in DuplicateStorageFinding.objects.filter(aws_account=aws_account, status='active')
-                ]
-            }
-        }
-    
-    return None
-
-def test_ebs_volumes(role_arn, external_id):
-    """List all EBS volumes"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        volumes = ec2.describe_volumes()
-        return {
-            'success': True,
-            'count': len(volumes.get('Volumes', [])),
-            'volumes': volumes.get('Volumes', [])
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'volumes': []}
-
-def test_elastic_ips(role_arn, external_id):
-    """List all Elastic IPs"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        addresses = ec2.describe_addresses()
-        addresses_list = addresses.get('Addresses', [])
-        unused_count = sum(1 for addr in addresses_list if not (addr.get('InstanceId') or addr.get('NetworkInterfaceId')))
-        
-        return {
-            'success': True,
-            'count': len(addresses_list),
-            'unused': unused_count,
-            'addresses': addresses_list
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'unused': 0, 'addresses': []}
-
-def test_rds_instances(role_arn, external_id):
-    """List all RDS instances"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        rds = boto3.client(
-            'rds',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        instances = rds.describe_db_instances()
-        return {
-            'success': True,
-            'count': len(instances.get('DBInstances', [])),
-            'instances': instances.get('DBInstances', [])
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'instances': []}
-
-def test_snapshots(role_arn, external_id):
-    """List all EBS snapshots"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        snapshots = ec2.describe_snapshots(OwnerIds=['self'])
-        snapshots_list = snapshots.get('Snapshots', [])
-        
-        cutoff_date = timezone.now() - timedelta(days=30)
-        old_count = 0
-        for snap in snapshots_list:
-            start_time = snap.get('StartTime')
-            if start_time and start_time.replace(tzinfo=timezone.utc) < cutoff_date:
-                old_count += 1
-        
-        return {
-            'success': True,
-            'count': len(snapshots_list),
-            'old_count': old_count,
-            'snapshots': snapshots_list
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'old_count': 0, 'snapshots': []}
-
-def test_unattached_ebs_volumes_only(role_arn, external_id):
-    """Find unattached EBS volumes only"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        volumes = ec2.describe_volumes()
-        unattached_volumes = []
-        
-        for vol in volumes.get('Volumes', []):
-            attachments = vol.get('Attachments', [])
-            is_attached = len(attachments) > 0
-            if not is_attached:
-                size_gb = vol.get('Size', 0)
-                volume_type = vol.get('VolumeType', 'gp2')
-                
-                # Calculate monthly cost
-                if volume_type == 'gp3':
-                    price_per_gb = 0.08
-                elif volume_type == 'gp2':
-                    price_per_gb = 0.10
-                else:
-                    price_per_gb = 0.10
-                
-                monthly_cost = size_gb * price_per_gb
-                unattached_volumes.append({
-                    'volume_id': vol['VolumeId'],
-                    'size_gb': size_gb,
-                    'volume_type': volume_type,
-                    'monthly_cost': round(monthly_cost, 2),
-                    'region': vol.get('AvailabilityZone', '')[:-1] if vol.get('AvailabilityZone') else 'us-east-1'
-                })
-        
-        return {
-            'success': True,
-            'count': len(unattached_volumes),
-            'unattached_volumes': unattached_volumes
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'unattached_volumes': []}
-
-def test_duplicate_snapshots(role_arn, external_id):
-    """Find duplicate snapshots"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        snapshots = ec2.describe_snapshots(OwnerIds=['self'])
-        
-        # Group snapshots by volume ID
-        snapshots_by_volume = {}
-        for snap in snapshots.get('Snapshots', []):
-            volume_id = snap.get('VolumeId')
-            if volume_id:
-                if volume_id not in snapshots_by_volume:
-                    snapshots_by_volume[volume_id] = []
-                snapshots_by_volume[volume_id].append(snap)
-        
-        duplicate_groups = []
-        for volume_id, vol_snapshots in snapshots_by_volume.items():
-            if len(vol_snapshots) > 3:
-                # Sort by date (oldest first)
-                vol_snapshots.sort(key=lambda x: x.get('StartTime', datetime.min))
-                redundant_snapshots = vol_snapshots[:-2]
-                total_size = sum(s.get('VolumeSize', 0) for s in redundant_snapshots)
-                monthly_cost = total_size * 0.05
-                
-                duplicate_groups.append({
-                    'volume_id': volume_id,
-                    'total_snapshots': len(vol_snapshots),
-                    'redundant_count': len(redundant_snapshots),
-                    'redundant_snapshots': [s['SnapshotId'] for s in redundant_snapshots],
-                    'total_size_gb': total_size,
-                    'monthly_cost': round(monthly_cost, 2)
-                })
-        
-        return {
-            'success': True,
-            'count': len(duplicate_groups),
-            'duplicate_groups': duplicate_groups
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'duplicate_groups': []}
-
-def test_idle_rds_instances(role_arn, external_id):
-    """Find idle RDS instances (low CPU usage)"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        rds = boto3.client(
-            'rds',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        cloudwatch = boto3.client(
-            'cloudwatch',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        instances = rds.describe_db_instances()
-        idle_instances = []
-        
-        for inst in instances.get('DBInstances', []):
-            instance_id = inst['DBInstanceIdentifier']
-            instance_state = inst.get('DBInstanceStatus', '')
-            
-            if instance_state == 'available':
-                end_time = timezone.now()
-                start_time = end_time - timedelta(days=7)
-                
-                try:
-                    metrics = cloudwatch.get_metric_statistics(
-                        Namespace='AWS/RDS',
-                        MetricName='CPUUtilization',
-                        Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
-                        StartTime=start_time,
-                        EndTime=end_time,
-                        Period=3600,
-                        Statistics=['Average']
-                    )
-                    
-                    datapoints = metrics.get('Datapoints', [])
-                    if datapoints:
-                        avg_cpu = sum(dp['Average'] for dp in datapoints) / len(datapoints)
-                        if avg_cpu < 10:
-                            instance_class = inst.get('DBInstanceClass', 'unknown')
-                            allocated_storage = inst.get('AllocatedStorage', 0)
-                            storage_cost = allocated_storage * 0.115
-                            
-                            if 'micro' in instance_class.lower():
-                                compute_cost = 12
-                            elif 'small' in instance_class.lower():
-                                compute_cost = 25
-                            else:
-                                compute_cost = 50
-                            
-                            total_cost = storage_cost + compute_cost
-                            idle_instances.append({
-                                'instance_id': instance_id,
-                                'instance_class': instance_class,
-                                'avg_cpu': round(avg_cpu, 2),
-                                'storage_gb': allocated_storage,
-                                'monthly_cost': round(total_cost, 2)
-                            })
-                except Exception:
-                    pass
-        
-        return {
-            'success': True,
-            'count': len(idle_instances),
-            'idle_instances': idle_instances
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'idle_instances': []}
-
-def test_unused_amis(role_arn, external_id):
-    """Find unused AMIs"""
-    try:
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
-        )
-        response = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="StorageScan",
-            ExternalId=str(external_id)
-        )
-        credentials = response["Credentials"]
-        
-        ec2 = boto3.client(
-            'ec2',
-            aws_access_key_id=credentials['AccessKeyId'],
-            aws_secret_access_key=credentials['SecretAccessKey'],
-            aws_session_token=credentials['SessionToken'],
-            region_name='us-east-1'
-        )
-        
-        # Get all AMIs owned by the account
-        images = ec2.describe_images(Owners=['self'])
-        
-        # Get all running instances
-        instances = ec2.describe_instances()
-        used_amis = set()
-        
-        for reservation in instances.get('Reservations', []):
-            for instance in reservation.get('Instances', []):
-                if instance.get('ImageId'):
-                    used_amis.add(instance['ImageId'])
-        
-        unused_amis = []
-        for image in images.get('Images', []):
-            image_id = image['ImageId']
-            if image_id not in used_amis:
-                creation_date = image.get('CreationDate', '')
-                if creation_date:
-                    try:
-                        from dateutil import parser
-                        creation_date_parsed = parser.parse(creation_date)
-                        age_days = (timezone.now() - creation_date_parsed).days
-                        if age_days > 30:
-                            volume_size = 0
-                            for block in image.get('BlockDeviceMappings', []):
-                                if 'Ebs' in block:
-                                    volume_size += block['Ebs'].get('VolumeSize', 0)
-                            monthly_cost = volume_size * 0.05
-                            unused_amis.append({
-                                'ami_id': image_id,
-                                'name': image.get('Name', 'Unnamed'),
-                                'age_days': age_days,
-                                'volume_size_gb': volume_size,
-                                'monthly_cost': round(monthly_cost, 2)
-                            })
-                    except Exception:
-                        pass
-        
-        return {
-            'success': True,
-            'count': len(unused_amis),
-            'unused_amis': unused_amis
-        }
-    except Exception as e:
-        return {'success': False, 'error': str(e), 'count': 0, 'unused_amis': []}
-
-
-# storage_optimization_service.py - Add these functions
+# myground/service_breakdown_service.py
+"""
+Service & Resource Breakdown
+Scans AWS, groups by service, generates AI verdicts per resource.
+"""
 
 import boto3
-from datetime import datetime, timedelta
-from django.conf import settings
-from django.utils import timezone
-from django.db import transaction
+from datetime import datetime, timezone
 from decimal import Decimal
-import logging
-import hashlib
+import requests
 import json
+import logging
 
-from myground.models import (
-    AWSAccount,
-    StorageOptimizationFinding,
-    DuplicateStorageFinding,
-    ResourceUsageSnapshot,
-    CpuUsageSnapshot,
-    StorageOptimizationSummary
-)
+from django.conf import settings
+from django.utils import timezone as django_timezone
+
+from .models import AWSAccount, ResourceAIAnalysis
 
 logger = logging.getLogger(__name__)
 
-def assume_role_for_account(aws_account):
-    """Helper to assume role and return credentials"""
+
+# ============================================================
+# PRICING TABLES (approximate)
+# ============================================================
+
+EC2_HOURLY = {
+    't2.micro': 0.0116, 't2.small': 0.023, 't2.medium': 0.0464,
+    't3.micro': 0.0104, 't3.small': 0.0208, 't3.medium': 0.0416, 't3.large': 0.0832,
+    'm5.large': 0.096, 'm5.xlarge': 0.192, 'm5.2xlarge': 0.384,
+    'c5.large': 0.085, 'c5.xlarge': 0.17, 'c5.2xlarge': 0.34,
+    'r5.large': 0.126, 'r5.xlarge': 0.252, 'r5.2xlarge': 0.504,
+    'default': 0.05,
+}
+
+RDS_HOURLY = {
+    'db.t3.micro': 0.017, 'db.t3.small': 0.034, 'db.t3.medium': 0.068,
+    'db.m5.large': 0.18, 'db.m5.xlarge': 0.36,
+    'db.r5.large': 0.24, 'db.r5.xlarge': 0.48,
+    'default': 0.10,
+}
+
+
+def assume_role(aws_account):
+    """Assume IAM role."""
     sts = boto3.client(
         'sts',
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
@@ -785,342 +50,557 @@ def assume_role_for_account(aws_account):
     )
     response = sts.assume_role(
         RoleArn=aws_account.role_arn,
-        RoleSessionName="StorageOptimizationScan",
+        RoleSessionName="ServiceBreakdown",
         ExternalId=str(aws_account.external_id)
     )
     return response["Credentials"]
 
-# storage_optimization_service.py - Fix the get_cached_storage_results function
 
-def get_cached_storage_results(user, aws_account, force_refresh=False):
-    """
-    Get cached storage results from database
-    Only makes AWS API calls if force_refresh=True or no cache exists
-    """
-    from .models import StorageOptimizationFinding, DuplicateStorageFinding, ResourceUsageSnapshot, StorageOptimizationSummary
-    
-    # If force_refresh is True, return None to force a fresh scan
-    if force_refresh:
-        print("🔄 Force refresh requested - skipping storage cache")
-        return None
-    
-    # Check if we have cached results (any age - we keep them until deleted)
-    cached_findings = StorageOptimizationFinding.objects.filter(
-        aws_account=aws_account,
-        status='active'
+def get_client(service, creds, region='us-east-1'):
+    return boto3.client(
+        service,
+        aws_access_key_id=creds['AccessKeyId'],
+        aws_secret_access_key=creds['SecretAccessKey'],
+        aws_session_token=creds['SessionToken'],
+        region_name=region
     )
-    
-    if cached_findings.exists():
-        logger.info(f"📦 Using cached storage findings: {cached_findings.count()} items")
+
+
+def get_cloudwatch_cpu(cw_client, namespace, dimensions, days=7):
+    """Get average CPU over N days."""
+    try:
+        from datetime import timedelta
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        response = cw_client.get_metric_statistics(
+            Namespace=namespace,
+            MetricName='CPUUtilization',
+            Dimensions=dimensions,
+            StartTime=start,
+            EndTime=end,
+            Period=3600,
+            Statistics=['Average']
+        )
+        points = response.get('Datapoints', [])
+        if not points:
+            return 0.0
+        return round(sum(p['Average'] for p in points) / len(points), 2)
+    except Exception:
+        return 0.0
+
+
+# ============================================================
+# AI VERDICT GENERATOR
+# ============================================================
+
+AI_PROMPT_TEMPLATE = """You are a Senior AWS FinOps Expert analyzing a single cloud resource.
+
+RESOURCE DETAILS:
+- Service: {service_name} ({service_category})
+- Resource ID: {resource_id}
+- Type: {resource_type}
+- Region: {region}
+- Status: {status}
+- On Since: {on_since}
+- CPU Average (7 days): {cpu_avg}%
+- Network In: {network_in_mb} MB
+- Network Out: {network_out_mb} MB
+- Monthly Cost: ${monthly_cost}
+- Tags: {tags}
+- Extra: {extra}
+
+YOUR TASK:
+Pick ONE verdict from this list:
+- LEAVE_IT (healthy, no action needed)
+- MONITOR_IT (not enough data, watch for 7 days)
+- SCHEDULE_IT (only used during certain hours, schedule start/stop)
+- DOWNSIZE_IT (over-provisioned, reduce size)
+- STOP_IT (idle, stop to save money)
+- TERMINATE_IT (unused, delete permanently)
+
+Respond ONLY with valid JSON in this exact format:
+{{
+    "verdict": "STOP_IT",
+    "short_reason": "One sentence summary (max 100 chars).",
+    "detailed_explanation": "Write 4-6 detailed sentences explaining WHY this verdict. Reference specific numbers from the data above. Talk about the risk of leaving it as-is, the impact of the recommended action, and any context that matters. Make it sound like a real expert. Do NOT be generic - use the actual values given.",
+    "savings_monthly": 11.20,
+    "savings_yearly": 134.40,
+    "risk": "LOW",
+    "steps": [
+        "Take a snapshot of attached EBS volumes first",
+        "Stop the instance (not terminate yet)",
+        "Monitor for 7 days for any breakage",
+        "If no issues appear, terminate"
+    ],
+    "alternatives": [
+        "Schedule 9AM-5PM only to save $7/month",
+        "Downsize to t3.nano to save $8/month"
+    ],
+    "time_to_fix": "5 minutes",
+    "one_click_available": true,
+    "priority": 8
+}}
+
+Rules:
+- savings_monthly: 0 if verdict is LEAVE_IT or MONITOR_IT
+- savings_yearly: savings_monthly * 12
+- risk: ZERO, LOW, MEDIUM, or HIGH
+- priority: 1-10 (10 = most urgent)
+- one_click_available: true only for STOP_IT / SCHEDULE_IT / TERMINATE_IT
+- Use realistic AWS pricing knowledge
+"""
+
+
+def get_ai_verdict(resource_data):
+    """Call Groq to get a verdict for one resource."""
+    try:
+        prompt = AI_PROMPT_TEMPLATE.format(**resource_data)
         
-        # Get summary from database
-        summary = StorageOptimizationSummary.objects.filter(aws_account=aws_account).first()
-        
-        # Get snapshots
-        ebs_snapshot = ResourceUsageSnapshot.objects.filter(
-            aws_account=aws_account,
-            service_name='ebs'
-        ).order_by('-snapshot_date').first()
-        
-        elastic_ip_snapshot = ResourceUsageSnapshot.objects.filter(
-            aws_account=aws_account,
-            service_name='elastic_ips'
-        ).order_by('-snapshot_date').first()
-        
-        rds_snapshot = ResourceUsageSnapshot.objects.filter(
-            aws_account=aws_account,
-            service_name='rds'
-        ).order_by('-snapshot_date').first()
-        
-        snapshots_snapshot = ResourceUsageSnapshot.objects.filter(
-            aws_account=aws_account,
-            service_name='snapshots'
-        ).order_by('-snapshot_date').first()
-        
-        # Build response from cached data
-        return {
-            'success': True,
-            'cached': True,
-            'total_findings': cached_findings.count(),
-            'total_potential_savings': float(summary.total_estimated_waste) if summary else 0,
-            'ebs_volumes': {
-                'total': ebs_snapshot.usage_value if ebs_snapshot else 0,
-                'unattached': cached_findings.filter(resource_type='ebs_volume').count(),
-                'unattached_volumes': [
-                    {
-                        'volume_id': f.resource_id,
-                        'size_gb': float(f.size_gb) if f.size_gb else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost),
-                        'region': f.region,
-                        'volume_type': f.metadata.get('volume_type', 'gp2') if f.metadata else 'gp2'
-                    }
-                    for f in cached_findings.filter(resource_type='ebs_volume')
-                ],
-                'items': []
-            },
-            'elastic_ips': {
-                'total': elastic_ip_snapshot.usage_value if elastic_ip_snapshot else 0,
-                'unused': cached_findings.filter(resource_type='elastic_ip').count(),
-                'items': [
-                    {
-                        'public_ip': f.resource_id,
-                        'allocation_id': f.metadata.get('allocation_id', '') if f.metadata else '',
-                        'domain': f.metadata.get('domain', '') if f.metadata else '',
-                        'is_associated': False
-                    }
-                    for f in cached_findings.filter(resource_type='elastic_ip')
-                ]
-            },
-            'rds_instances': {
-                'total': rds_snapshot.usage_value if rds_snapshot else 0,
-                'items': []
-            },
-            'snapshots': {
-                'total': snapshots_snapshot.usage_value if snapshots_snapshot else 0,
-                'old': cached_findings.filter(resource_type='ebs_snapshot').count(),
-                'items': [
-                    {
-                        'snapshot_id': f.resource_id,
-                        'volume_size': float(f.size_gb) if f.size_gb else 0,
-                        'age_days': f.metadata.get('age_days', 0) if f.metadata else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost)
-                    }
-                    for f in cached_findings.filter(resource_type='ebs_snapshot')
-                ]
-            },
-            'idle_rds_instances': {
-                'count': cached_findings.filter(resource_type='rds_instance').count(),
-                'items': [
-                    {
-                        'instance_id': f.resource_id,
-                        'instance_class': f.metadata.get('instance_class', 'unknown') if f.metadata else 'unknown',
-                        'avg_cpu': f.metadata.get('avg_cpu', 0) if f.metadata else 0,
-                        'storage_gb': f.metadata.get('storage_gb', 0) if f.metadata else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost)
-                    }
-                    for f in cached_findings.filter(resource_type='rds_instance')
-                ]
-            },
-            'unused_amis': {
-                'count': cached_findings.filter(resource_type='unused_ami').count(),
-                'items': [
-                    {
-                        'ami_id': f.resource_id,
-                        'name': f.resource_name,
-                        'age_days': f.metadata.get('age_days', 0) if f.metadata else 0,
-                        'volume_size_gb': float(f.size_gb) if f.size_gb else 0,
-                        'monthly_cost': float(f.estimated_monthly_cost)
-                    }
-                    for f in cached_findings.filter(resource_type='unused_ami')
-                ]
-            },
-            'duplicate_snapshots': {
-                'count': DuplicateStorageFinding.objects.filter(aws_account=aws_account, status='active').count(),
-                'items': [
-                    {
-                        'volume_id': d.group_id,
-                        'total_snapshots': len(d.resources) + 2,
-                        'redundant_count': len(d.resources),
-                        'total_size_gb': float(d.total_wasted_size_gb) if d.total_wasted_size_gb else 0,
-                        'monthly_cost': float(d.estimated_savings)
-                    }
-                    for d in DuplicateStorageFinding.objects.filter(aws_account=aws_account, status='active')
-                ]
-            }
+        headers = {
+            "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+            "Content-Type": "application/json"
         }
-    
-    return None
-
-# storage_optimization_service.py - Add this function if not present
-
-def clear_all_storage_data(aws_account):
-    """
-    Clear all storage optimization data from database
-    Called when user clicks "Clear Cache" button
-    """
-    from .models import StorageOptimizationFinding, DuplicateStorageFinding, ResourceUsageSnapshot, StorageOptimizationSummary
-    
-    with transaction.atomic():
-        # Delete all findings
-        findings_count = StorageOptimizationFinding.objects.filter(aws_account=aws_account).delete()[0]
-        duplicates_count = DuplicateStorageFinding.objects.filter(aws_account=aws_account).delete()[0]
-        snapshots_count = ResourceUsageSnapshot.objects.filter(aws_account=aws_account).delete()[0]
-        summary_count = StorageOptimizationSummary.objects.filter(aws_account=aws_account).delete()[0]
         
-        logger.info(f"🗑️ Cleared storage data: {findings_count} findings, {duplicates_count} duplicates, {snapshots_count} snapshots")
-        
-        return {
-            'findings_deleted': findings_count,
-            'duplicates_deleted': duplicates_count,
-            'snapshots_deleted': snapshots_count,
-            'total_deleted': findings_count + duplicates_count + snapshots_count + summary_count
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": "You are a Senior AWS FinOps Expert. Respond ONLY with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.4,
+            "max_tokens": 900,
+            "response_format": {"type": "json_object"}
         }
-
-# storage_optimization_service.py - Make sure this function is complete
-
-def save_scan_results_to_db(user, aws_account, scan_results):
-    """Save all scan results to database (overwrites existing)"""
-    from .models import (
-        StorageOptimizationFinding, DuplicateStorageFinding,
-        ResourceUsageSnapshot, CpuUsageSnapshot, StorageOptimizationSummary
-    )
-    
-    with transaction.atomic():
-        # Delete OLD data first (complete refresh)
-        StorageOptimizationFinding.objects.filter(aws_account=aws_account).delete()
-        DuplicateStorageFinding.objects.filter(aws_account=aws_account).delete()
-        ResourceUsageSnapshot.objects.filter(aws_account=aws_account).delete()
-        CpuUsageSnapshot.objects.filter(aws_account=aws_account).delete()
-        StorageOptimizationSummary.objects.filter(aws_account=aws_account).delete()
         
-        # Save EBS volume findings
-        for vol in scan_results.get('ebs_volumes', {}).get('unattached_volumes', []):
-            StorageOptimizationFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                resource_type='ebs_volume',
-                resource_id=vol['volume_id'],
-                resource_name=f"EBS Volume {vol['volume_id']}",
-                region=vol.get('region', 'unknown'),
-                size_gb=vol.get('size_gb', 0),
-                estimated_monthly_cost=vol.get('monthly_cost', 0),
-                confidence_score=95,
-                reason="This EBS volume is not attached to any EC2 instance, meaning it's not being used but still incurring storage costs.",
-                recommendation=f"Delete this unattached volume to save ${vol.get('monthly_cost', 0)}/month.",
-                severity='high' if vol.get('monthly_cost', 0) > 50 else 'medium',
-                status='active',
-                metadata={
-                    'size_gb': vol.get('size_gb'),
-                    'volume_type': vol.get('volume_type'),
-                    'scan_timestamp': timezone.now().isoformat()
-                }
-            )
-        
-        # Save Elastic IP findings
-        for ip in scan_results.get('elastic_ips', {}).get('items', []):
-            if not ip.get('is_associated', False):
-                StorageOptimizationFinding.objects.create(
-                    user=user,
-                    aws_account=aws_account,
-                    resource_type='elastic_ip',
-                    resource_id=ip.get('public_ip', 'unknown'),
-                    resource_name=f"Elastic IP {ip.get('public_ip', 'unknown')}",
-                    region='global',
-                    estimated_monthly_cost=3.65,
-                    confidence_score=100,
-                    reason="This Elastic IP is allocated but not associated with any resource. AWS charges for unattached Elastic IPs.",
-                    recommendation="Release this Elastic IP to stop incurring charges.",
-                    severity='medium',
-                    status='active',
-                    metadata={
-                        'allocation_id': ip.get('allocation_id'),
-                        'domain': ip.get('domain')
-                    }
-                )
-        
-        # Save idle RDS findings
-        for rds in scan_results.get('idle_rds_instances', {}).get('items', []):
-            StorageOptimizationFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                resource_type='rds_instance',
-                resource_id=rds['instance_id'],
-                resource_name=f"RDS {rds['instance_id']}",
-                region=aws_account.account_id[:10],
-                estimated_monthly_cost=rds.get('monthly_cost', 0),
-                confidence_score=85,
-                reason=f"This RDS instance has very low CPU utilization ({rds.get('avg_cpu', 0)}% average over 7 days).",
-                recommendation=f"Consider downsizing or stopping this instance. Potential savings: ${rds.get('monthly_cost', 0)}/month.",
-                severity='medium' if rds.get('monthly_cost', 0) > 30 else 'low',
-                status='active',
-                metadata={
-                    'instance_class': rds.get('instance_class'),
-                    'avg_cpu': rds.get('avg_cpu'),
-                    'storage_gb': rds.get('storage_gb')
-                }
-            )
-        
-        # Save old snapshot findings
-        for snap in scan_results.get('snapshots', {}).get('items', []):
-            if snap.get('age_days', 0) > 30:
-                StorageOptimizationFinding.objects.create(
-                    user=user,
-                    aws_account=aws_account,
-                    resource_type='ebs_snapshot',
-                    resource_id=snap['snapshot_id'],
-                    resource_name=f"Snapshot {snap['snapshot_id'][:20]}",
-                    region='global',
-                    size_gb=snap.get('volume_size', 0),
-                    estimated_monthly_cost=snap.get('monthly_cost', 0),
-                    confidence_score=90,
-                    reason=f"This snapshot is {snap.get('age_days', 0)} days old.",
-                    recommendation=f"Delete this old snapshot to save ${snap.get('monthly_cost', 0)}/month.",
-                    severity='low',
-                    status='active',
-                    metadata={
-                        'age_days': snap.get('age_days'),
-                        'volume_size': snap.get('volume_size')
-                    }
-                )
-        
-        # Save unused AMI findings
-        for ami in scan_results.get('unused_amis', {}).get('items', []):
-            StorageOptimizationFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                resource_type='unused_ami',
-                resource_id=ami['ami_id'],
-                resource_name=ami['name'],
-                region='global',
-                size_gb=ami.get('volume_size_gb', 0),
-                estimated_monthly_cost=ami.get('monthly_cost', 0),
-                confidence_score=90,
-                reason=f"This AMI is {ami.get('age_days', 0)} days old and not used.",
-                recommendation=f"Deregister this unused AMI to save ${ami.get('monthly_cost', 0)}/month.",
-                severity='low',
-                status='active',
-                metadata={
-                    'age_days': ami.get('age_days'),
-                    'volume_size_gb': ami.get('volume_size_gb')
-                }
-            )
-        
-        # Save duplicate snapshot findings
-        for dup in scan_results.get('duplicate_snapshots', {}).get('items', []):
-            DuplicateStorageFinding.objects.create(
-                user=user,
-                aws_account=aws_account,
-                duplicate_type='redundant_backup',
-                group_id=dup['volume_id'],
-                group_name=f"Snapshots for volume {dup['volume_id']}",
-                resources=dup.get('redundant_snapshots', []),
-                total_wasted_size_gb=dup.get('total_size_gb', 0),
-                estimated_savings=dup.get('monthly_cost', 0),
-                reason=f"You have {dup.get('total_snapshots', 0)} snapshots for this volume.",
-                recommendation=f"Delete {dup.get('redundant_count', 0)} old snapshots to save ${dup.get('monthly_cost', 0)}/month.",
-                status='active'
-            )
-        
-        # Update summary
-        total_savings = sum(float(f.estimated_monthly_cost) for f in StorageOptimizationFinding.objects.filter(aws_account=aws_account))
-        
-        StorageOptimizationSummary.objects.create(
-            user=user,
-            aws_account=aws_account,
-            total_idle_resources=StorageOptimizationFinding.objects.filter(aws_account=aws_account).count(),
-            total_estimated_waste=total_savings,
-            duplicate_candidates=DuplicateStorageFinding.objects.filter(aws_account=aws_account).count(),
-            duplicate_savings=sum(float(d.estimated_savings) for d in DuplicateStorageFinding.objects.filter(aws_account=aws_account)),
-            idle_cpu_resources=StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='rds_instance').count(),
-            cpu_savings=sum(float(f.estimated_monthly_cost) for f in StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='rds_instance')),
-            summary_data={
-                'ebs_unattached': StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='ebs_volume').count(),
-                'elastic_ips_unused': StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='elastic_ip').count(),
-                'old_snapshots': StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='ebs_snapshot').count(),
-                'unused_amis': StorageOptimizationFinding.objects.filter(aws_account=aws_account, resource_type='unused_ami').count(),
-                'duplicate_groups': DuplicateStorageFinding.objects.filter(aws_account=aws_account).count()
-            }
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
         )
         
-        logger.info(f"💾 Saved {StorageOptimizationFinding.objects.filter(aws_account=aws_account).count()} storage findings to database")
-        return True
+        if response.status_code == 200:
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            return json.loads(content)
+        else:
+            logger.error(f"Groq error: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"AI verdict error: {e}")
+        return None
+
+
+def fallback_verdict(resource_data):
+    """Fallback if AI fails."""
+    cpu = resource_data.get('cpu_avg', 0)
+    status = resource_data.get('status', 'UNKNOWN')
+    cost = float(resource_data.get('monthly_cost', 0))
+    
+    if status == 'STOPPED':
+        return {
+            "verdict": "TERMINATE_IT",
+            "short_reason": "Instance is stopped — likely forgotten.",
+            "detailed_explanation": f"This resource is currently stopped but still exists in your account. It hasn't been running, which suggests it may be a forgotten leftover from a past task. If it's not needed, terminating it removes the resource permanently from your AWS account. If you're unsure, you can monitor it for a few more days before deleting.",
+            "savings_monthly": 0, "savings_yearly": 0,
+            "risk": "LOW", "steps": ["Verify no snapshots needed", "Terminate the instance"],
+            "alternatives": ["Keep it stopped for 30 more days"],
+            "time_to_fix": "2 minutes", "one_click_available": True, "priority": 4
+        }
+    elif cpu < 5 and cost > 5:
+        return {
+            "verdict": "STOP_IT",
+            "short_reason": f"CPU average is {cpu}% — resource is idle.",
+            "detailed_explanation": f"This resource has been running at only {cpu}% average CPU utilization, which is far below the healthy threshold of 30-60%. It's costing you ${cost}/month while producing almost no work. Stopping this resource will immediately reduce your bill without impacting any real workload, since no meaningful traffic is hitting it. Take a snapshot first for safety.",
+            "savings_monthly": round(cost, 2), "savings_yearly": round(cost * 12, 2),
+            "risk": "LOW", "steps": ["Take a snapshot", "Stop the instance", "Monitor 7 days"],
+            "alternatives": [f"Downsize for partial savings"],
+            "time_to_fix": "5 minutes", "one_click_available": True, "priority": 7
+        }
+    else:
+        return {
+            "verdict": "MONITOR_IT",
+            "short_reason": "Not enough data to recommend action.",
+            "detailed_explanation": "We don't have enough usage history to give a confident recommendation. Monitor this resource for another 7 days to gather more data points. Once we have at least a week of stable CPU and network metrics, the AI can give you a clear verdict.",
+            "savings_monthly": 0, "savings_yearly": 0,
+            "risk": "ZERO", "steps": ["Check back in 7 days"],
+            "alternatives": [],
+            "time_to_fix": "N/A", "one_click_available": False, "priority": 1
+        }
+
+
+# ============================================================
+# RESOURCE SCANNERS (EC2, RDS, S3, Lambda)
+# ============================================================
+
+def scan_ec2(creds, region='us-east-1'):
+    """Scan all EC2 instances."""
+    resources = []
+    try:
+        ec2 = get_client('ec2', creds, region)
+        cw = get_client('cloudwatch', creds, region)
+        
+        instances = ec2.describe_instances()
+        for reservation in instances.get('Reservations', []):
+            for inst in reservation.get('Instances', []):
+                state = inst['State']['Name']
+                status = 'ON' if state == 'running' else 'STOPPED' if state == 'stopped' else 'UNKNOWN'
+                
+                # CPU metrics (only if running)
+                cpu_avg = 0.0
+                if status == 'ON':
+                    cpu_avg = get_cloudwatch_cpu(
+                        cw, 'AWS/EC2',
+                        [{'Name': 'InstanceId', 'Value': inst['InstanceId']}]
+                    )
+                
+                # Cost
+                itype = inst.get('InstanceType', 'unknown')
+                hourly = EC2_HOURLY.get(itype, EC2_HOURLY['default'])
+                monthly = round(hourly * 730, 2) if status == 'ON' else 0.0
+                
+                # Name tag
+                name = next((t['Value'] for t in inst.get('Tags', []) if t['Key'] == 'Name'), inst['InstanceId'])
+                
+                # Tags dict
+                tags = {t['Key']: t['Value'] for t in inst.get('Tags', [])}
+                
+                # On since
+                on_since = inst.get('LaunchTime')
+                
+                resources.append({
+                    'service_category': 'Compute',
+                    'service_name': 'EC2',
+                    'resource_id': inst['InstanceId'],
+                    'resource_name': name,
+                    'resource_type': itype,
+                    'region': region,
+                    'tags': tags,
+                    'status': status,
+                    'on_since': on_since,
+                    'last_checked': datetime.now(timezone.utc),
+                    'cpu_avg': cpu_avg,
+                    'network_in_mb': 0.0,
+                    'network_out_mb': 0.0,
+                    'disk_read_mb': 0.0,
+                    'disk_write_mb': 0.0,
+                    'monthly_cost': Decimal(str(monthly)),
+                    'resource_details': {
+                        'vpc_id': inst.get('VpcId'),
+                        'subnet_id': inst.get('SubnetId'),
+                        'private_ip': inst.get('PrivateIpAddress'),
+                        'public_ip': inst.get('PublicIpAddress'),
+                    }
+                })
+    except Exception as e:
+        logger.error(f"EC2 scan error: {e}")
+    return resources
+
+
+def scan_rds(creds, region='us-east-1'):
+    """Scan all RDS instances."""
+    resources = []
+    try:
+        rds = get_client('rds', creds, region)
+        cw = get_client('cloudwatch', creds, region)
+        
+        instances = rds.describe_db_instances()
+        for db in instances.get('DBInstances', []):
+            status = 'ON' if db.get('DBInstanceStatus') == 'available' else 'UNKNOWN'
+            
+            cpu_avg = 0.0
+            if status == 'ON':
+                cpu_avg = get_cloudwatch_cpu(
+                    cw, 'AWS/RDS',
+                    [{'Name': 'DBInstanceIdentifier', 'Value': db['DBInstanceIdentifier']}]
+                )
+            
+            iclass = db.get('DBInstanceClass', 'unknown')
+            hourly = RDS_HOURLY.get(iclass, RDS_HOURLY['default'])
+            storage_gb = db.get('AllocatedStorage', 20)
+            storage_cost = storage_gb * 0.115
+            monthly = round((hourly * 730) + storage_cost, 2) if status == 'ON' else 0.0
+            
+            tags = {t['Key']: t['Value'] for t in db.get('TagList', [])}
+            
+            resources.append({
+                'service_category': 'Database',
+                'service_name': 'RDS',
+                'resource_id': db['DBInstanceIdentifier'],
+                'resource_name': db['DBInstanceIdentifier'],
+                'resource_type': iclass,
+                'region': region,
+                'tags': tags,
+                'status': status,
+                'on_since': db.get('InstanceCreateTime'),
+                'last_checked': datetime.now(timezone.utc),
+                'cpu_avg': cpu_avg,
+                'network_in_mb': 0.0,
+                'network_out_mb': 0.0,
+                'disk_read_mb': 0.0,
+                'disk_write_mb': 0.0,
+                'monthly_cost': Decimal(str(monthly)),
+                'resource_details': {
+                    'engine': db.get('Engine'),
+                    'allocated_storage_gb': storage_gb,
+                    'multi_az': db.get('MultiAZ'),
+                    'endpoint': db.get('Endpoint', {}).get('Address'),
+                }
+            })
+    except Exception as e:
+        logger.error(f"RDS scan error: {e}")
+    return resources
+
+
+def scan_s3(creds):
+    """Scan all S3 buckets."""
+    resources = []
+    try:
+        s3 = get_client('s3', creds)
+        buckets = s3.list_buckets()
+        for bucket in buckets.get('Buckets', []):
+            # Rough estimate — real size needs CloudWatch or inventory
+            monthly = 0.023 * 10  # Assume 10GB for baseline
+            
+            resources.append({
+                'service_category': 'Storage',
+                'service_name': 'S3',
+                'resource_id': bucket['Name'],
+                'resource_name': bucket['Name'],
+                'resource_type': 'Bucket',
+                'region': 'global',
+                'tags': {},
+                'status': 'ON',
+                'on_since': bucket.get('CreationDate'),
+                'last_checked': datetime.now(timezone.utc),
+                'cpu_avg': 0.0,
+                'network_in_mb': 0.0,
+                'network_out_mb': 0.0,
+                'disk_read_mb': 0.0,
+                'disk_write_mb': 0.0,
+                'monthly_cost': Decimal(str(round(monthly, 2))),
+                'resource_details': {}
+            })
+    except Exception as e:
+        logger.error(f"S3 scan error: {e}")
+    return resources
+
+
+def scan_lambda(creds, region='us-east-1'):
+    """Scan all Lambda functions."""
+    resources = []
+    try:
+        lam = get_client('lambda', creds, region)
+        funcs = lam.list_functions()
+        for fn in funcs.get('Functions', []):
+            memory = fn.get('MemorySize', 128)
+            monthly = round((memory / 1024) * 0.0000166667 * 1000000 + 0.20, 2)
+            
+            resources.append({
+                'service_category': 'Compute',
+                'service_name': 'Lambda',
+                'resource_id': fn['FunctionName'],
+                'resource_name': fn['FunctionName'],
+                'resource_type': fn.get('Runtime', 'unknown'),
+                'region': region,
+                'tags': fn.get('Tags', {}),
+                'status': 'ON',
+                'on_since': None,
+                'last_checked': datetime.now(timezone.utc),
+                'cpu_avg': 0.0,
+                'network_in_mb': 0.0,
+                'network_out_mb': 0.0,
+                'disk_read_mb': 0.0,
+                'disk_write_mb': 0.0,
+                'monthly_cost': Decimal(str(monthly)),
+                'resource_details': {
+                    'memory_mb': memory,
+                    'timeout': fn.get('Timeout'),
+                }
+            })
+    except Exception as e:
+        logger.error(f"Lambda scan error: {e}")
+    return resources
+
+
+# ============================================================
+# MAIN BREAKDOWN FUNCTION
+# ============================================================
+
+def generate_breakdown(aws_account, force_refresh=False):
+    """
+    Main function — scans AWS, generates AI verdicts, saves to DB.
+    If force_refresh=False and data exists, returns cached data.
+    """
+    # Check cache
+    if not force_refresh:
+        existing = ResourceAIAnalysis.objects.filter(aws_account=aws_account)
+        if existing.exists():
+            logger.info(f"📦 Returning cached data: {existing.count()} resources")
+            return build_response(aws_account, cached=True)
+    
+    logger.info(f"🔄 Fresh scan starting for {aws_account.account_id}")
+    
+    # Delete old data
+    ResourceAIAnalysis.objects.filter(aws_account=aws_account).delete()
+    
+    # Assume role
+    try:
+        creds = assume_role(aws_account)
+    except Exception as e:
+        logger.error(f"Role assumption failed: {e}")
+        return {'error': f'Failed to assume role: {e}'}
+    
+    # Scan all services
+    all_resources = []
+    all_resources.extend(scan_ec2(creds))
+    all_resources.extend(scan_rds(creds))
+    all_resources.extend(scan_s3(creds))
+    all_resources.extend(scan_lambda(creds))
+    
+    logger.info(f"📊 Scanned {len(all_resources)} total resources")
+    
+    # For each resource, get AI verdict and save
+    for r in all_resources:
+        # Build AI input
+        ai_input = {
+            'service_name': r['service_name'],
+            'service_category': r['service_category'],
+            'resource_id': r['resource_id'],
+            'resource_type': r['resource_type'],
+            'region': r['region'],
+            'status': r['status'],
+            'on_since': r['on_since'].isoformat() if r['on_since'] else 'N/A',
+            'cpu_avg': r['cpu_avg'],
+            'network_in_mb': r['network_in_mb'],
+            'network_out_mb': r['network_out_mb'],
+            'monthly_cost': float(r['monthly_cost']),
+            'tags': json.dumps(r['tags']),
+            'extra': json.dumps(r.get('resource_details', {}))
+        }
+        
+        verdict = get_ai_verdict(ai_input) or fallback_verdict(ai_input)
+        
+        # Save to DB
+        ResourceAIAnalysis.objects.update_or_create(
+            aws_account=aws_account,
+            resource_id=r['resource_id'],
+            defaults={
+                'user': aws_account.user,
+                'service_category': r['service_category'],
+                'service_name': r['service_name'],
+                'resource_name': r['resource_name'],
+                'resource_type': r['resource_type'],
+                'region': r['region'],
+                'tags': r['tags'],
+                'status': r['status'],
+                'on_since': r['on_since'],
+                'last_checked': r['last_checked'],
+                'cpu_avg': r['cpu_avg'],
+                'network_in_mb': r['network_in_mb'],
+                'network_out_mb': r['network_out_mb'],
+                'disk_read_mb': r['disk_read_mb'],
+                'disk_write_mb': r['disk_write_mb'],
+                'monthly_cost': r['monthly_cost'],
+                'ai_verdict': verdict.get('verdict', 'MONITOR_IT'),
+                'ai_short_reason': verdict.get('short_reason', ''),
+                'ai_detailed_explanation': verdict.get('detailed_explanation', ''),
+                'ai_savings_monthly': Decimal(str(verdict.get('savings_monthly', 0))),
+                'ai_savings_yearly': Decimal(str(verdict.get('savings_yearly', 0))),
+                'ai_risk': verdict.get('risk', 'LOW'),
+                'ai_steps': verdict.get('steps', []),
+                'ai_alternatives': verdict.get('alternatives', []),
+                'ai_time_to_fix': verdict.get('time_to_fix', ''),
+                'ai_one_click_available': verdict.get('one_click_available', False),
+                'ai_priority': verdict.get('priority', 5),
+                'resource_details': r.get('resource_details', {}),
+            }
+        )
+    
+    logger.info(f"✅ Saved {len(all_resources)} resources with AI verdicts")
+    return build_response(aws_account, cached=False)
+
+
+def build_response(aws_account, cached=False):
+    """Format DB data into service + resource breakdown."""
+    resources = ResourceAIAnalysis.objects.filter(aws_account=aws_account)
+    
+    # Group by service
+    services_map = {}
+    for r in resources:
+        key = r.service_name
+        if key not in services_map:
+            services_map[key] = {
+                'service_name': r.service_name,
+                'service_category': r.service_category,
+                'status': 'Active',
+                'resource_count': 0,
+                'monthly_cost': 0.0,
+                'savings': 0.0,
+                'resources': []
+            }
+        
+        services_map[key]['resource_count'] += 1
+        services_map[key]['monthly_cost'] += float(r.monthly_cost)
+        services_map[key]['savings'] += float(r.ai_savings_monthly)
+        
+        services_map[key]['resources'].append({
+            'resource_id': r.resource_id,
+            'resource_name': r.resource_name,
+            'resource_type': r.resource_type,
+            'region': r.region,
+            'service_name': r.service_name,              # <-- ADDED
+            'service_category': r.service_category,      # <-- ADDED
+            'status': r.status,
+            'on_since': r.on_since.isoformat() if r.on_since else None,
+            'last_checked': r.last_checked.isoformat() if r.last_checked else None,
+            'cpu_avg': r.cpu_avg,
+            'monthly_cost': float(r.monthly_cost),
+            'ai_verdict': r.ai_verdict,
+            'ai_short_reason': r.ai_short_reason,
+            'ai_detailed_explanation': r.ai_detailed_explanation,
+            'ai_savings_monthly': float(r.ai_savings_monthly),
+            'ai_savings_yearly': float(r.ai_savings_yearly),
+            'ai_risk': r.ai_risk,
+            'ai_steps': r.ai_steps,
+            'ai_alternatives': r.ai_alternatives,
+            'ai_time_to_fix': r.ai_time_to_fix,
+            'ai_one_click_available': r.ai_one_click_available,
+            'ai_priority': r.ai_priority,
+            'tags': r.tags,
+            'resource_details': r.resource_details,
+        })
+    
+    # Compute status per service
+    for svc in services_map.values():
+        idle_count = sum(1 for r in svc['resources'] if r['ai_verdict'] in ['STOP_IT', 'TERMINATE_IT'])
+        if idle_count == svc['resource_count'] and svc['resource_count'] > 0:
+            svc['status'] = 'Idle'
+        elif idle_count > 0:
+            svc['status'] = 'Partially Idle'
+        else:
+            svc['status'] = 'Active'
+        svc['monthly_cost'] = round(svc['monthly_cost'], 2)
+        svc['savings'] = round(svc['savings'], 2)
+    
+    services_list = sorted(services_map.values(), key=lambda x: x['monthly_cost'], reverse=True)
+    all_resources_list = sorted(
+        [r for svc in services_list for r in svc['resources']],
+        key=lambda x: (-x['ai_priority'], -x['monthly_cost'])
+    )
+    
+    total_cost = round(sum(s['monthly_cost'] for s in services_list), 2)
+    total_savings = round(sum(s['savings'] for s in services_list), 2)
+    
+    return {
+        'success': True,
+        'cached': cached,
+        'total_services': len(services_list),
+        'total_resources': len(all_resources_list),
+        'total_monthly_cost': total_cost,
+        'total_savings': total_savings,
+        'services': services_list,
+        'resources': all_resources_list,
+        'last_scan': django_timezone.now().isoformat(),
+    }
