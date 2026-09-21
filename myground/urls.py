@@ -115,22 +115,8 @@ path( 'aws/accounts/<int:account_db_id>/resources/<path:resource_id>/action/',vi
     path('aws/accounts/<int:account_db_id>/forecast/', views.get_cost_forecast, name='cost_forecast'),
     path('aws/accounts/<int:account_db_id>/forecast/service/<str:service_name>/', views.get_service_forecast_detail, name='service_forecast_detail'),
     
-    # ============================================================
-    # STORAGE OPTIMIZATION
-    # ============================================================
-    path('storage-scan/ebs/<int:account_id>/', views.scan_ebs_volumes_view, name='scan_ebs'),
-    path('storage-scan/elastic-ips/<int:account_id>/', views.scan_elastic_ips_view, name='scan_elastic_ips'),
-    path('storage-scan/rds/<int:account_id>/', views.scan_rds_instances_view, name='scan_rds'),
-    path('storage-scan/snapshots/<int:account_id>/', views.scan_snapshots_view, name='scan_snapshots'),
-    path('storage-scan/unattached-ebs/<int:account_id>/', views.scan_unattached_ebs_volumes, name='scan_unattached_ebs'),
-    path('storage-scan/duplicate-snapshots/<int:account_id>/', views.scan_duplicate_snapshots, name='scan_duplicate_snapshots'),
-    path('storage-scan/idle-rds/<int:account_id>/', views.scan_idle_rds_instances, name='scan_idle_rds'),
-    path('storage-scan/unused-amis/<int:account_id>/', views.scan_unused_amis, name='scan_unused_amis'),
-    path('storage-scan/complete/<int:account_id>/', views.run_complete_storage_scan, name='scan_complete'),
-    path('storage/findings/<int:account_id>/', views.get_storage_findings, name='storage_findings'),
-    path('storage/dismiss/<str:finding_id>/', views.dismiss_storage_finding, name='dismiss_finding'),
-    path('storage-clear/<int:account_id>/', views.clear_storage_cache, name='clear_storage_cache'),
-    
+   
+  
     # ============================================================
     # IDLE RESOURCES
     # ============================================================
