@@ -420,7 +420,6 @@ def _is_ai_scannable(r):
 # ============================================================
 # MAIN ENTRY — SCAN + AI + SAVE
 # ============================================================
-
 def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
     # ---------- CACHE HIT ----------
     if not force_refresh:
@@ -436,7 +435,7 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
     logger.info(f"🔄 Fresh scan: {aws_account.account_id} / {region}")
     scan_started = time.time()
 
-    # Wipe: this region's rows, plus any stale rows from before we added region_scanned
+    # Wipe this region's rows + stale pre-region rows
     ResourceAIAnalysis.objects.filter(
         aws_account=aws_account, region_scanned=region,
     ).delete()
@@ -453,111 +452,140 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
         logger.error(f"Role assumption failed: {e}")
         return {'error': f'Failed to assume role: {e}'}
 
-    raw_resources = scan_region(creds, region)
-    logger.info(f"📊 Discovered {len(raw_resources)} resources in {region}")
+    # ---------- SCAN + PERSIST MODULE BY MODULE (memory friendly) ----------
+    scanners = _get_discovery_scanners()
 
     ai_calls_made = 0
     ai_calls_skipped = 0
-    saved_rows = []
+    total_cost = 0.0
+    total_savings = 0.0
+    service_names_seen = set()
+    top_findings_pool = []
+    total_resources_count = 0
 
-    for r in raw_resources:
-        if _is_ai_scannable(r):
-            ai_input = {
-                'service_name': r['service_name'],
-                'service_category': r['service_category'],
-                'resource_id': r['resource_id'],
-                'resource_type': r['resource_type'],
-                'region': r['region'],
-                'status': r['status'],
-                'cpu_avg': r['cpu_avg'],
-                'monthly_cost': float(r['monthly_cost']),
-                'tags': json.dumps(r['tags']),
-                'extra': json.dumps(r.get('resource_details', {})),
-            }
-            verdict = get_ai_verdict(ai_input)
-            if verdict:
-                ai_calls_made += 1
-            else:
-                verdict = fallback_verdict(ai_input)
-                ai_calls_skipped += 1
-        else:
-            ai_calls_skipped += 1
-            verdict = {
-                'verdict': 'MONITOR_IT',
-                'short_reason': 'Cost is negligible — no action needed.',
-                'detailed_explanation': '',
-                'savings_monthly': 0, 'savings_yearly': 0,
-                'risk': 'ZERO', 'steps': [], 'alternatives': [],
-                'time_to_fix': 'N/A',
-                'one_click_available': False, 'priority': 1,
-            }
+    for label, fn in scanners:
+        module_started = time.time()
+        try:
+            raw_list = fn(creds, region) or []
+        except Exception as e:
+            logger.warning(f"❌ {label} in {region} failed: {e}")
+            continue
 
-        saved_rows.append((r, verdict))
+        # Normalize
+        normalized = [
+            _normalize_discovery_resource(raw, label, region)
+            for raw in raw_list
+        ]
+        if not normalized:
+            continue
 
-    # ---------- PERSIST (update_or_create to avoid unique collisions) ----------
-    with transaction.atomic():
-        for r, verdict in saved_rows:
-            ResourceAIAnalysis.objects.update_or_create(
-                aws_account=aws_account,
-                resource_id=r['resource_id'],
-                region_scanned=region,
-                defaults={
-                    'user': aws_account.user,
-                    'service_category': r['service_category'],
+        # Build ORM objects for this module only
+        objects_to_create = []
+        for r in normalized:
+            if _is_ai_scannable(r) and ai_calls_made < 30:
+                ai_input = {
                     'service_name': r['service_name'],
-                    'resource_name': r['resource_name'],
+                    'service_category': r['service_category'],
+                    'resource_id': r['resource_id'],
                     'resource_type': r['resource_type'],
                     'region': r['region'],
-                    'tags': _json_safe(r['tags']),
                     'status': r['status'],
-                    'on_since': _safe_datetime(r['on_since']),
-                    'last_checked': _safe_datetime(r['last_checked']),
                     'cpu_avg': r['cpu_avg'],
-                    'network_in_mb': r['network_in_mb'],
-                    'network_out_mb': r['network_out_mb'],
-                    'disk_read_mb': r['disk_read_mb'],
-                    'disk_write_mb': r['disk_write_mb'],
-                    'monthly_cost': r['monthly_cost'],
-                    'ai_verdict': verdict.get('verdict', 'MONITOR_IT'),
-                    'ai_short_reason': verdict.get('short_reason', ''),
-                    'ai_detailed_explanation': verdict.get('detailed_explanation', ''),
-                    'ai_savings_monthly': _to_decimal(verdict.get('savings_monthly', 0)),
-                    'ai_savings_yearly': _to_decimal(verdict.get('savings_yearly', 0)),
-                    'ai_risk': verdict.get('risk', 'LOW'),
-                    'ai_steps': _json_safe(verdict.get('steps', [])),
-                    'ai_alternatives': _json_safe(verdict.get('alternatives', [])),
-                    'ai_time_to_fix': verdict.get('time_to_fix', ''),
-                    'ai_one_click_available': verdict.get('one_click_available', False),
-                    'ai_priority': verdict.get('priority', 5),
-                    'resource_details': _json_safe(r['resource_details']),
-                },
+                    'monthly_cost': float(r['monthly_cost']),
+                    'tags': json.dumps(r['tags']),
+                    'extra': json.dumps(r.get('resource_details', {})),
+                }
+                verdict = get_ai_verdict(ai_input)
+                if verdict:
+                    ai_calls_made += 1
+                else:
+                    verdict = fallback_verdict(ai_input)
+                    ai_calls_skipped += 1
+            else:
+                ai_calls_skipped += 1
+                verdict = {
+                    'verdict': 'MONITOR_IT',
+                    'short_reason': 'Cost is negligible — no action needed.',
+                    'detailed_explanation': '',
+                    'savings_monthly': 0, 'savings_yearly': 0,
+                    'risk': 'ZERO', 'steps': [], 'alternatives': [],
+                    'time_to_fix': 'N/A',
+                    'one_click_available': False, 'priority': 1,
+                }
+
+            savings_monthly = float(verdict.get('savings_monthly', 0))
+            total_cost += float(r['monthly_cost'])
+            total_savings += savings_monthly
+            service_names_seen.add(r['service_name'])
+
+            if savings_monthly > 0:
+                top_findings_pool.append({
+                    'title': f"{r['service_name']} · {r['resource_id']}",
+                    'verdict': verdict.get('verdict', 'MONITOR_IT'),
+                    'cost': round(float(r['monthly_cost']), 2),
+                    'savings': round(savings_monthly, 2),
+                })
+
+            objects_to_create.append(ResourceAIAnalysis(
+                user=aws_account.user,
+                aws_account=aws_account,
+                service_category=r['service_category'],
+                service_name=r['service_name'],
+                resource_id=r['resource_id'],
+                resource_name=r['resource_name'],
+                resource_type=r['resource_type'],
+                region=r['region'],
+                region_scanned=region,
+                tags=_json_safe(r['tags']),
+                status=r['status'],
+                on_since=_safe_datetime(r['on_since']),
+                last_checked=_safe_datetime(r['last_checked']),
+                cpu_avg=r['cpu_avg'],
+                network_in_mb=r['network_in_mb'],
+                network_out_mb=r['network_out_mb'],
+                disk_read_mb=r['disk_read_mb'],
+                disk_write_mb=r['disk_write_mb'],
+                monthly_cost=r['monthly_cost'],
+                ai_verdict=verdict.get('verdict', 'MONITOR_IT'),
+                ai_short_reason=verdict.get('short_reason', ''),
+                ai_detailed_explanation=verdict.get('detailed_explanation', ''),
+                ai_savings_monthly=_to_decimal(savings_monthly),
+                ai_savings_yearly=_to_decimal(verdict.get('savings_yearly', 0)),
+                ai_risk=verdict.get('risk', 'LOW'),
+                ai_steps=_json_safe(verdict.get('steps', [])),
+                ai_alternatives=_json_safe(verdict.get('alternatives', [])),
+                ai_time_to_fix=verdict.get('time_to_fix', ''),
+                ai_one_click_available=verdict.get('one_click_available', False),
+                ai_priority=verdict.get('priority', 5),
+                resource_details=_json_safe(r['resource_details']),
+            ))
+
+        # Bulk insert this module's rows — one SQL statement, low memory
+        if objects_to_create:
+            ResourceAIAnalysis.objects.bulk_create(
+                objects_to_create,
+                batch_size=50,          # keep memory low
+                ignore_conflicts=True,  # never crash on a duplicate
             )
+            total_resources_count += len(objects_to_create)
 
-    scan_duration = round(time.time() - scan_started, 1)
+        # Free memory
+        del normalized
+        del objects_to_create
+        del raw_list
 
-    total_cost = sum(float(r['monthly_cost']) for r, _ in saved_rows)
-    total_savings = sum(float(v.get('savings_monthly', 0)) for _, v in saved_rows)
+        logger.info(f"✅ {label} in {region}: persisted ({time.time()-module_started:.1f}s)")
 
+    # ---------- AI SUMMARY ----------
     sorted_by_savings = sorted(
-        [
-            {
-                'title': f"{r['service_name']} · {r['resource_id']}",
-                'verdict': v.get('verdict', 'MONITOR_IT'),
-                'cost': round(float(r['monthly_cost']), 2),
-                'savings': round(float(v.get('savings_monthly', 0)), 2),
-            }
-            for r, v in saved_rows
-            if v.get('savings_monthly', 0) > 0
-        ],
-        key=lambda x: x['savings'],
-        reverse=True,
-    )
+        top_findings_pool, key=lambda x: x['savings'], reverse=True,
+    )[:12]
 
     summary_text = ''
-    if saved_rows:
+    if total_resources_count:
         summary_text = get_scan_summary(
             region=region,
-            total_resources=len(saved_rows),
+            total_resources=total_resources_count,
             total_cost=round(total_cost, 2),
             total_savings=round(total_savings, 2),
             top_findings=sorted_by_savings,
@@ -567,22 +595,24 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
         user=aws_account.user,
         aws_account=aws_account,
         region_scanned=region,
-        total_resources=len(saved_rows),
-        total_services=len({r['service_name'] for r, _ in saved_rows}),
+        total_resources=total_resources_count,
+        total_services=len(service_names_seen),
         total_monthly_cost=_to_decimal(total_cost),
         total_savings_monthly=_to_decimal(total_savings),
         ai_summary=summary_text or '',
-        ai_summary_data=_json_safe({'top_findings': sorted_by_savings[:12]}),
-        scan_duration_seconds=scan_duration,
+        ai_summary_data=_json_safe({'top_findings': sorted_by_savings}),
+        scan_duration_seconds=round(time.time() - scan_started, 1),
         ai_calls_made=ai_calls_made,
         ai_calls_skipped=ai_calls_skipped,
     )
 
-    logger.info(f"✅ Scan complete in {scan_duration}s — AI calls: {ai_calls_made} made, {ai_calls_skipped} skipped")
+    logger.info(
+        f"✅ Scan complete in {round(time.time()-scan_started, 1)}s — "
+        f"{total_resources_count} resources, "
+        f"AI calls: {ai_calls_made} made, {ai_calls_skipped} skipped"
+    )
 
     return build_response(aws_account, region, cached=False)
-
-
 # ============================================================
 # BUILD RESPONSE FROM DB
 # ============================================================
