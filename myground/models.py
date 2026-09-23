@@ -1398,6 +1398,7 @@ class ResourceAIAnalysis(models.Model):
     
     # Resource identity
     resource_id = models.CharField(max_length=500)  # e.g., "i-abc123"
+    region_scanned = models.CharField(max_length=50, blank=True, default='', db_index=True)
     resource_name = models.CharField(max_length=500, blank=True)
     resource_type = models.CharField(max_length=100)  # e.g., "t2.micro", "db.m5.large"
     region = models.CharField(max_length=50, blank=True)
@@ -1451,3 +1452,44 @@ class ResourceAIAnalysis(models.Model):
     
     def __str__(self):
         return f"{self.service_name}: {self.resource_id} - {self.ai_verdict}"
+
+
+# ============================================================
+# BREAKDOWN SUMMARY (one row per account + region)
+# ============================================================
+class BreakdownSummary(models.Model):
+    """
+    Stores the AI-generated summary paragraph for a full
+    Service & Resource Breakdown scan of one account + region.
+    Cached forever until explicitly cleared.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='breakdown_summaries')
+    aws_account = models.ForeignKey(AWSAccount, on_delete=models.CASCADE, related_name='breakdown_summaries')
+    region_scanned = models.CharField(max_length=50, db_index=True)
+
+    # Scan stats
+    total_resources = models.IntegerField(default=0)
+    total_services = models.IntegerField(default=0)
+    total_monthly_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_savings_monthly = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    # AI summary
+    ai_summary = models.TextField(blank=True)
+    ai_summary_data = models.JSONField(default=dict, blank=True)
+
+    # Metadata
+    scan_duration_seconds = models.FloatField(null=True, blank=True)
+    ai_calls_made = models.IntegerField(default=0)
+    ai_calls_skipped = models.IntegerField(default=0)
+    scanned_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('aws_account', 'region_scanned')
+        ordering = ['-scanned_at']
+        indexes = [
+            models.Index(fields=['aws_account', 'region_scanned']),
+        ]
+
+    def __str__(self):
+        return f"{self.aws_account.account_alias} - {self.region_scanned} - {self.total_resources} resources"

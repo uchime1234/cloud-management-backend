@@ -1,7 +1,15 @@
 # myground/service_breakdown_service.py
 """
 Service & Resource Breakdown
-Scans AWS, groups by service, generates AI verdicts per resource.
+Uses the Discovery/* modules to scan all AWS resources in a single region,
+runs per-resource AI verdicts on scannable resources, and produces one
+AI-generated summary per scan.
+
+Caching:
+- Every ResourceAIAnalysis row carries `region_scanned`.
+- Per-resource results are cached per (account, region).
+- BreakdownSummary is cached per (account, region).
+- Nothing expires automatically. Clear cache deletes rows for one region.
 """
 
 import boto3
@@ -10,87 +18,169 @@ from decimal import Decimal
 import requests
 import json
 import logging
+import time
 
 from django.conf import settings
 from django.utils import timezone as django_timezone
+from django.db import transaction
 
-from .models import AWSAccount, ResourceAIAnalysis
+from .models import AWSAccount, ResourceAIAnalysis, BreakdownSummary
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# PRICING TABLES (approximate)
+# DISCOVERY MODULE REGISTRY
+# ============================================================
+# All discovery modules live in myground/Discovery/
+# Each exposes a `discover_<service>_services(creds, region)` function.
+# We import lazily and tolerate missing modules so a broken one
+# doesn't break the whole scan.
+
+def _get_discovery_scanners():
+    """
+    Returns a list of (service_label, callable) tuples.
+    The callable accepts (creds, region) and returns a list of resource dicts.
+    """
+    scanners = []
+
+    def _safe_import(module_path, func_name, label):
+        try:
+            module = __import__(module_path, fromlist=[func_name])
+            fn = getattr(module, func_name)
+            scanners.append((label, fn))
+        except Exception as e:
+            logger.warning(f"Discovery module {module_path}.{func_name} unavailable: {e}")
+
+    _safe_import('myground.Discovery.ec2_discovery',        'discover_ec2_services',        'EC2')
+    _safe_import('myground.Discovery.rds_discovery',        'discover_rds_services',        'RDS')
+    _safe_import('myground.Discovery.s3_discovery',         'discover_s3_services',         'S3')
+    _safe_import('myground.Discovery.lambda_discovery',     'discover_lambda_services',     'Lambda')
+    _safe_import('myground.Discovery.dynamodb_discovery',   'discover_dynamodb_services',   'DynamoDB')
+    _safe_import('myground.Discovery.ecs_discovery',        'discover_ecs_services',        'ECS')
+    _safe_import('myground.Discovery.eks_discovery',        'discover_eks_services',        'EKS')
+    _safe_import('myground.Discovery.elb_discovery',        'discover_elb_services',        'ELB')
+    _safe_import('myground.Discovery.vpc_discovery',        'discover_vpc_services',        'VPC')
+    _safe_import('myground.Discovery.route53_discovery',    'discover_route53_services',    'Route53')
+    _safe_import('myground.Discovery.cloudfront_discovery', 'discover_cloudfront_distributions', 'CloudFront')
+    _safe_import('myground.Discovery.waf_discovery',        'discover_waf_services',        'WAF')
+    _safe_import('myground.Discovery.shield_discovery',     'discover_shield_services',     'Shield')
+    _safe_import('myground.Discovery.kms_discovery',        'discover_kms_services',        'KMS')
+    _safe_import('myground.Discovery.sns_discovery',        'discover_sns_services',        'SNS')
+    _safe_import('myground.Discovery.sqs_discovery',        'discover_sqs_services',        'SQS')
+    _safe_import('myground.Discovery.ssm_discovery',        'discover_ssm_services',        'SSM')
+    _safe_import('myground.Discovery.stepfunctions_discovery', 'discover_stepfunctions_services', 'StepFunctions')
+    _safe_import('myground.Discovery.eventbridge_discovery','discover_eventbridge_services','EventBridge')
+    _safe_import('myground.Discovery.cloudwatch_discovery', 'discover_cloudwatch_services', 'CloudWatch')
+    _safe_import('myground.Discovery.cloudtrail_discovery', 'discover_cloudtrail_services', 'CloudTrail')
+    _safe_import('myground.Discovery.apigateway_discovery', 'discover_apigateway_services', 'APIGateway')
+    _safe_import('myground.Discovery.dms_discovery',        'discover_dms_services',        'DMS')
+    _safe_import('myground.Discovery.guardduty_discovery',  'discover_guardduty_services',  'GuardDuty')
+    _safe_import('myground.Discovery.cloudformation_discovery', 'discover_cloudformation_services', 'CloudFormation')
+
+    return scanners
+
+
+# ============================================================
+# ASSUME ROLE
 # ============================================================
 
-EC2_HOURLY = {
-    't2.micro': 0.0116, 't2.small': 0.023, 't2.medium': 0.0464,
-    't3.micro': 0.0104, 't3.small': 0.0208, 't3.medium': 0.0416, 't3.large': 0.0832,
-    'm5.large': 0.096, 'm5.xlarge': 0.192, 'm5.2xlarge': 0.384,
-    'c5.large': 0.085, 'c5.xlarge': 0.17, 'c5.2xlarge': 0.34,
-    'r5.large': 0.126, 'r5.xlarge': 0.252, 'r5.2xlarge': 0.504,
-    'default': 0.05,
-}
-
-RDS_HOURLY = {
-    'db.t3.micro': 0.017, 'db.t3.small': 0.034, 'db.t3.medium': 0.068,
-    'db.m5.large': 0.18, 'db.m5.xlarge': 0.36,
-    'db.r5.large': 0.24, 'db.r5.xlarge': 0.48,
-    'default': 0.10,
-}
-
-
 def assume_role(aws_account):
-    """Assume IAM role."""
     sts = boto3.client(
         'sts',
         aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
         aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-        region_name=settings.AWS_REGION
+        region_name=settings.AWS_REGION,
     )
     response = sts.assume_role(
         RoleArn=aws_account.role_arn,
-        RoleSessionName="ServiceBreakdown",
-        ExternalId=str(aws_account.external_id)
+        RoleSessionName='ServiceBreakdown',
+        ExternalId=str(aws_account.external_id),
     )
-    return response["Credentials"]
-
-
-def get_client(service, creds, region='us-east-1'):
-    return boto3.client(
-        service,
-        aws_access_key_id=creds['AccessKeyId'],
-        aws_secret_access_key=creds['SecretAccessKey'],
-        aws_session_token=creds['SessionToken'],
-        region_name=region
-    )
-
-
-def get_cloudwatch_cpu(cw_client, namespace, dimensions, days=7):
-    """Get average CPU over N days."""
-    try:
-        from datetime import timedelta
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=days)
-        response = cw_client.get_metric_statistics(
-            Namespace=namespace,
-            MetricName='CPUUtilization',
-            Dimensions=dimensions,
-            StartTime=start,
-            EndTime=end,
-            Period=3600,
-            Statistics=['Average']
-        )
-        points = response.get('Datapoints', [])
-        if not points:
-            return 0.0
-        return round(sum(p['Average'] for p in points) / len(points), 2)
-    except Exception:
-        return 0.0
+    return response['Credentials']
 
 
 # ============================================================
-# AI VERDICT GENERATOR
+# NORMALIZE A DISCOVERY RESOURCE INTO OUR SHAPE
+# ============================================================
+
+def _to_decimal(value, default=0):
+    try:
+        if value is None:
+            return Decimal(str(default))
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(str(default))
+
+
+def _normalize_discovery_resource(raw, service_label, region):
+    """
+    Discovery modules return dicts shaped like:
+        { 'service_id', 'resource_id', 'resource_name', 'region',
+          'estimated_monthly_cost', 'count', 'details', 'service_type' }
+    Convert that into the fields our model + AI prompt expect.
+    """
+    raw = raw or {}
+    resource_id = str(raw.get('resource_id') or raw.get('service_id') or 'unknown')
+    resource_name = str(raw.get('resource_name') or resource_id)
+    region_value = raw.get('region') or region or 'global'
+
+    # Discovery modules call it estimated_monthly_cost; our model calls it monthly_cost
+    cost_raw = raw.get('estimated_monthly_cost', 0)
+    # A few modules return hourly — guard by magnitude (very rough heuristic)
+    monthly_cost = _to_decimal(cost_raw, 0)
+
+    service_category = raw.get('service_type') or service_label
+
+    return {
+        'service_category': service_category,
+        'service_name': service_label,
+        'resource_id': resource_id,
+        'resource_name': resource_name,
+        'resource_type': raw.get('resource_type') or raw.get('service_id') or 'Unknown',
+        'region': region_value,
+        'region_scanned': region,
+        'tags': raw.get('tags') if isinstance(raw.get('tags'), dict) else {},
+        'status': raw.get('status') or 'ON',
+        'on_since': raw.get('on_since'),           # usually absent, that's ok
+        'last_checked': datetime.now(timezone.utc),
+        'cpu_avg': float(raw.get('cpu_avg') or 0.0),
+        'network_in_mb': float(raw.get('network_in_mb') or 0.0),
+        'network_out_mb': float(raw.get('network_out_mb') or 0.0),
+        'disk_read_mb': float(raw.get('disk_read_mb') or 0.0),
+        'disk_write_mb': float(raw.get('disk_write_mb') or 0.0),
+        'monthly_cost': monthly_cost,
+        'resource_details': raw.get('details') if isinstance(raw.get('details'), dict) else {},
+    }
+
+
+# ============================================================
+# SCAN ONE REGION
+# ============================================================
+
+def scan_region(creds, region):
+    """
+    Runs every discovery module against a single region and returns
+    a list of normalized resource dicts.
+    """
+    scanners = _get_discovery_scanners()
+    all_resources = []
+
+    for label, fn in scanners:
+        started = time.time()
+        try:
+            raw_list = fn(creds, region) or []
+            for raw in raw_list:
+                all_resources.append(_normalize_discovery_resource(raw, label, region))
+            logger.info(f"✅ {label} in {region}: {len(raw_list)} resources ({time.time()-started:.1f}s)")
+        except Exception as e:
+            logger.warning(f"❌ {label} in {region} failed: {e}")
+
+    return all_resources
+
+
+# ============================================================
+# AI — PER-RESOURCE VERDICT
 # ============================================================
 
 AI_PROMPT_TEMPLATE = """You are a Senior AWS FinOps Expert analyzing a single cloud resource.
@@ -101,432 +191,389 @@ RESOURCE DETAILS:
 - Type: {resource_type}
 - Region: {region}
 - Status: {status}
-- On Since: {on_since}
 - CPU Average (7 days): {cpu_avg}%
-- Network In: {network_in_mb} MB
-- Network Out: {network_out_mb} MB
 - Monthly Cost: ${monthly_cost}
 - Tags: {tags}
 - Extra: {extra}
 
 YOUR TASK:
-Pick ONE verdict from this list:
-- LEAVE_IT (healthy, no action needed)
-- MONITOR_IT (not enough data, watch for 7 days)
-- SCHEDULE_IT (only used during certain hours, schedule start/stop)
-- DOWNSIZE_IT (over-provisioned, reduce size)
+Pick ONE verdict:
+- LEAVE_IT (healthy)
+- MONITOR_IT (not enough data)
+- SCHEDULE_IT (only used at certain hours)
+- DOWNSIZE_IT (over-provisioned)
 - STOP_IT (idle, stop to save money)
 - TERMINATE_IT (unused, delete permanently)
 
 Respond ONLY with valid JSON in this exact format:
 {{
     "verdict": "STOP_IT",
-    "short_reason": "One sentence summary (max 100 chars).",
-    "detailed_explanation": "Write 4-6 detailed sentences explaining WHY this verdict. Reference specific numbers from the data above. Talk about the risk of leaving it as-is, the impact of the recommended action, and any context that matters. Make it sound like a real expert. Do NOT be generic - use the actual values given.",
+    "short_reason": "One sentence (max 100 chars).",
+    "detailed_explanation": "4-6 sentences referencing the actual numbers above.",
     "savings_monthly": 11.20,
     "savings_yearly": 134.40,
     "risk": "LOW",
-    "steps": [
-        "Take a snapshot of attached EBS volumes first",
-        "Stop the instance (not terminate yet)",
-        "Monitor for 7 days for any breakage",
-        "If no issues appear, terminate"
-    ],
-    "alternatives": [
-        "Schedule 9AM-5PM only to save $7/month",
-        "Downsize to t3.nano to save $8/month"
-    ],
+    "steps": ["Step 1", "Step 2", "Step 3"],
+    "alternatives": ["Alt 1", "Alt 2"],
     "time_to_fix": "5 minutes",
     "one_click_available": true,
     "priority": 8
 }}
 
 Rules:
-- savings_monthly: 0 if verdict is LEAVE_IT or MONITOR_IT
-- savings_yearly: savings_monthly * 12
-- risk: ZERO, LOW, MEDIUM, or HIGH
-- priority: 1-10 (10 = most urgent)
-- one_click_available: true only for STOP_IT / SCHEDULE_IT / TERMINATE_IT
-- Use realistic AWS pricing knowledge
+- savings_monthly = 0 if verdict is LEAVE_IT or MONITOR_IT
+- savings_yearly = savings_monthly * 12
+- risk: ZERO, LOW, MEDIUM, HIGH
+- priority: 1-10
+- one_click_available: true only for STOP_IT, SCHEDULE_IT, TERMINATE_IT
 """
 
 
 def get_ai_verdict(resource_data):
-    """Call Groq to get a verdict for one resource."""
     try:
         prompt = AI_PROMPT_TEMPLATE.format(**resource_data)
-        
+
         headers = {
-            "Authorization": f"Bearer {settings.GROQ_API_KEY}",
-            "Content-Type": "application/json"
+            'Authorization': f'Bearer {settings.GROQ_API_KEY}',
+            'Content-Type': 'application/json',
         }
-        
         payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": "You are a Senior AWS FinOps Expert. Respond ONLY with valid JSON."},
-                {"role": "user", "content": prompt}
+            'model': 'llama-3.3-70b-versatile',
+            'messages': [
+                {'role': 'system', 'content': 'You are a Senior AWS FinOps Expert. Respond ONLY with valid JSON.'},
+                {'role': 'user', 'content': prompt},
             ],
-            "temperature": 0.4,
-            "max_tokens": 900,
-            "response_format": {"type": "json_object"}
+            'temperature': 0.4,
+            'max_tokens': 900,
+            'response_format': {'type': 'json_object'},
         }
-        
+
         response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers=headers, json=payload, timeout=30,
         )
-        
         if response.status_code == 200:
             result = response.json()
             content = result['choices'][0]['message']['content']
             return json.loads(content)
-        else:
-            logger.error(f"Groq error: {response.status_code} - {response.text}")
-            return None
-            
+        logger.error(f"Groq error: {response.status_code} - {response.text}")
     except Exception as e:
         logger.error(f"AI verdict error: {e}")
-        return None
+    return None
 
 
 def fallback_verdict(resource_data):
-    """Fallback if AI fails."""
+    """Used when AI is skipped or fails."""
     cpu = resource_data.get('cpu_avg', 0)
     status = resource_data.get('status', 'UNKNOWN')
     cost = float(resource_data.get('monthly_cost', 0))
-    
+
     if status == 'STOPPED':
         return {
-            "verdict": "TERMINATE_IT",
-            "short_reason": "Instance is stopped — likely forgotten.",
-            "detailed_explanation": f"This resource is currently stopped but still exists in your account. It hasn't been running, which suggests it may be a forgotten leftover from a past task. If it's not needed, terminating it removes the resource permanently from your AWS account. If you're unsure, you can monitor it for a few more days before deleting.",
-            "savings_monthly": 0, "savings_yearly": 0,
-            "risk": "LOW", "steps": ["Verify no snapshots needed", "Terminate the instance"],
-            "alternatives": ["Keep it stopped for 30 more days"],
-            "time_to_fix": "2 minutes", "one_click_available": True, "priority": 4
+            'verdict': 'TERMINATE_IT',
+            'short_reason': 'Resource is stopped — likely forgotten.',
+            'detailed_explanation': 'This resource is stopped but still exists. If it is not needed, terminating removes it permanently.',
+            'savings_monthly': 0, 'savings_yearly': 0,
+            'risk': 'LOW',
+            'steps': ['Verify no snapshots needed', 'Terminate the resource'],
+            'alternatives': ['Keep it stopped for 30 more days'],
+            'time_to_fix': '2 minutes', 'one_click_available': True, 'priority': 4,
         }
-    elif cpu < 5 and cost > 5:
+    if cpu < 5 and cost > 5 and status == 'ON':
         return {
-            "verdict": "STOP_IT",
-            "short_reason": f"CPU average is {cpu}% — resource is idle.",
-            "detailed_explanation": f"This resource has been running at only {cpu}% average CPU utilization, which is far below the healthy threshold of 30-60%. It's costing you ${cost}/month while producing almost no work. Stopping this resource will immediately reduce your bill without impacting any real workload, since no meaningful traffic is hitting it. Take a snapshot first for safety.",
-            "savings_monthly": round(cost, 2), "savings_yearly": round(cost * 12, 2),
-            "risk": "LOW", "steps": ["Take a snapshot", "Stop the instance", "Monitor 7 days"],
-            "alternatives": [f"Downsize for partial savings"],
-            "time_to_fix": "5 minutes", "one_click_available": True, "priority": 7
+            'verdict': 'STOP_IT',
+            'short_reason': f'CPU average is {cpu}% — resource is idle.',
+            'detailed_explanation': f'This resource runs at only {cpu}% average CPU but costs ${cost}/month. Stopping it removes that cost with no impact on real work.',
+            'savings_monthly': round(cost, 2), 'savings_yearly': round(cost * 12, 2),
+            'risk': 'LOW',
+            'steps': ['Take a snapshot', 'Stop the instance', 'Monitor 7 days'],
+            'alternatives': ['Downsize for partial savings'],
+            'time_to_fix': '5 minutes', 'one_click_available': True, 'priority': 7,
         }
-    else:
-        return {
-            "verdict": "MONITOR_IT",
-            "short_reason": "Not enough data to recommend action.",
-            "detailed_explanation": "We don't have enough usage history to give a confident recommendation. Monitor this resource for another 7 days to gather more data points. Once we have at least a week of stable CPU and network metrics, the AI can give you a clear verdict.",
-            "savings_monthly": 0, "savings_yearly": 0,
-            "risk": "ZERO", "steps": ["Check back in 7 days"],
-            "alternatives": [],
-            "time_to_fix": "N/A", "one_click_available": False, "priority": 1
+    return {
+        'verdict': 'MONITOR_IT',
+        'short_reason': 'Not enough data for a confident recommendation.',
+        'detailed_explanation': 'We need more usage history. Monitor for another 7 days to gather metrics before deciding.',
+        'savings_monthly': 0, 'savings_yearly': 0,
+        'risk': 'ZERO', 'steps': ['Check back in 7 days'],
+        'alternatives': [],
+        'time_to_fix': 'N/A', 'one_click_available': False, 'priority': 1,
+    }
+
+
+# ============================================================
+# AI — SCAN SUMMARY
+# ============================================================
+
+def get_scan_summary(region, total_resources, total_cost, total_savings, top_findings):
+    """
+    One AI call per scan that produces a plain-English summary.
+    top_findings is a list of dicts {title, verdict, cost, savings}.
+    """
+    try:
+        findings_text = '\n'.join(
+            f"- {f['title']} → {f['verdict']} (cost ${f['cost']}/mo, save ${f['savings']}/mo)"
+            for f in top_findings[:12]
+        ) or 'No actionable findings.'
+
+        prompt = f"""You are a Senior AWS FinOps Expert summarizing a completed scan.
+
+SCAN RESULTS — REGION: {region}
+- Total resources scanned: {total_resources}
+- Total monthly cost: ${total_cost}
+- Total potential monthly savings: ${total_savings}
+
+TOP FINDINGS (highest savings first):
+{findings_text}
+
+Write a concise, friendly summary for the user. Structure:
+
+**What we found** — 2-3 sentences on the overall state of their account.
+**Biggest wins** — 3 bullets, one per top finding, with the dollar amount.
+**What to do next** — 1 short paragraph telling them exactly what to click first.
+
+Rules:
+- Speak directly to the user ("you", "your account").
+- Be specific — quote real dollar amounts from the data above.
+- Max 220 words total.
+- No markdown headers except the three bold labels above.
+"""
+        headers = {
+            'Authorization': f'Bearer {settings.GROQ_API_KEY}',
+            'Content-Type': 'application/json',
         }
+        payload = {
+            'model': 'llama-3.3-70b-versatile',
+            'messages': [
+                {'role': 'system', 'content': 'You are a Senior AWS FinOps Expert. Be specific and concise.'},
+                {'role': 'user', 'content': prompt},
+            ],
+            'temperature': 0.6,
+            'max_tokens': 600,
+        }
+        r = requests.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers=headers, json=payload, timeout=45,
+        )
+        if r.status_code == 200:
+            return r.json()['choices'][0]['message']['content']
+        logger.error(f"Groq summary error: {r.status_code} - {r.text}")
+    except Exception as e:
+        logger.error(f"AI summary error: {e}")
+    return ''
 
 
 # ============================================================
-# RESOURCE SCANNERS (EC2, RDS, S3, Lambda)
+# SHOULD THIS RESOURCE GO TO GROQ?
 # ============================================================
 
-def scan_ec2(creds, region='us-east-1'):
-    """Scan all EC2 instances."""
-    resources = []
-    try:
-        ec2 = get_client('ec2', creds, region)
-        cw = get_client('cloudwatch', creds, region)
-        
-        instances = ec2.describe_instances()
-        for reservation in instances.get('Reservations', []):
-            for inst in reservation.get('Instances', []):
-                state = inst['State']['Name']
-                status = 'ON' if state == 'running' else 'STOPPED' if state == 'stopped' else 'UNKNOWN'
-                
-                # CPU metrics (only if running)
-                cpu_avg = 0.0
-                if status == 'ON':
-                    cpu_avg = get_cloudwatch_cpu(
-                        cw, 'AWS/EC2',
-                        [{'Name': 'InstanceId', 'Value': inst['InstanceId']}]
-                    )
-                
-                # Cost
-                itype = inst.get('InstanceType', 'unknown')
-                hourly = EC2_HOURLY.get(itype, EC2_HOURLY['default'])
-                monthly = round(hourly * 730, 2) if status == 'ON' else 0.0
-                
-                # Name tag
-                name = next((t['Value'] for t in inst.get('Tags', []) if t['Key'] == 'Name'), inst['InstanceId'])
-                
-                # Tags dict
-                tags = {t['Key']: t['Value'] for t in inst.get('Tags', [])}
-                
-                # On since
-                on_since = inst.get('LaunchTime')
-                
-                resources.append({
-                    'service_category': 'Compute',
-                    'service_name': 'EC2',
-                    'resource_id': inst['InstanceId'],
-                    'resource_name': name,
-                    'resource_type': itype,
-                    'region': region,
-                    'tags': tags,
-                    'status': status,
-                    'on_since': on_since,
-                    'last_checked': datetime.now(timezone.utc),
-                    'cpu_avg': cpu_avg,
-                    'network_in_mb': 0.0,
-                    'network_out_mb': 0.0,
-                    'disk_read_mb': 0.0,
-                    'disk_write_mb': 0.0,
-                    'monthly_cost': Decimal(str(monthly)),
-                    'resource_details': {
-                        'vpc_id': inst.get('VpcId'),
-                        'subnet_id': inst.get('SubnetId'),
-                        'private_ip': inst.get('PrivateIpAddress'),
-                        'public_ip': inst.get('PublicIpAddress'),
-                    }
-                })
-    except Exception as e:
-        logger.error(f"EC2 scan error: {e}")
-    return resources
-
-
-def scan_rds(creds, region='us-east-1'):
-    """Scan all RDS instances."""
-    resources = []
-    try:
-        rds = get_client('rds', creds, region)
-        cw = get_client('cloudwatch', creds, region)
-        
-        instances = rds.describe_db_instances()
-        for db in instances.get('DBInstances', []):
-            status = 'ON' if db.get('DBInstanceStatus') == 'available' else 'UNKNOWN'
-            
-            cpu_avg = 0.0
-            if status == 'ON':
-                cpu_avg = get_cloudwatch_cpu(
-                    cw, 'AWS/RDS',
-                    [{'Name': 'DBInstanceIdentifier', 'Value': db['DBInstanceIdentifier']}]
-                )
-            
-            iclass = db.get('DBInstanceClass', 'unknown')
-            hourly = RDS_HOURLY.get(iclass, RDS_HOURLY['default'])
-            storage_gb = db.get('AllocatedStorage', 20)
-            storage_cost = storage_gb * 0.115
-            monthly = round((hourly * 730) + storage_cost, 2) if status == 'ON' else 0.0
-            
-            tags = {t['Key']: t['Value'] for t in db.get('TagList', [])}
-            
-            resources.append({
-                'service_category': 'Database',
-                'service_name': 'RDS',
-                'resource_id': db['DBInstanceIdentifier'],
-                'resource_name': db['DBInstanceIdentifier'],
-                'resource_type': iclass,
-                'region': region,
-                'tags': tags,
-                'status': status,
-                'on_since': db.get('InstanceCreateTime'),
-                'last_checked': datetime.now(timezone.utc),
-                'cpu_avg': cpu_avg,
-                'network_in_mb': 0.0,
-                'network_out_mb': 0.0,
-                'disk_read_mb': 0.0,
-                'disk_write_mb': 0.0,
-                'monthly_cost': Decimal(str(monthly)),
-                'resource_details': {
-                    'engine': db.get('Engine'),
-                    'allocated_storage_gb': storage_gb,
-                    'multi_az': db.get('MultiAZ'),
-                    'endpoint': db.get('Endpoint', {}).get('Address'),
-                }
-            })
-    except Exception as e:
-        logger.error(f"RDS scan error: {e}")
-    return resources
-
-
-def scan_s3(creds):
-    """Scan all S3 buckets."""
-    resources = []
-    try:
-        s3 = get_client('s3', creds)
-        buckets = s3.list_buckets()
-        for bucket in buckets.get('Buckets', []):
-            # Rough estimate — real size needs CloudWatch or inventory
-            monthly = 0.023 * 10  # Assume 10GB for baseline
-            
-            resources.append({
-                'service_category': 'Storage',
-                'service_name': 'S3',
-                'resource_id': bucket['Name'],
-                'resource_name': bucket['Name'],
-                'resource_type': 'Bucket',
-                'region': 'global',
-                'tags': {},
-                'status': 'ON',
-                'on_since': bucket.get('CreationDate'),
-                'last_checked': datetime.now(timezone.utc),
-                'cpu_avg': 0.0,
-                'network_in_mb': 0.0,
-                'network_out_mb': 0.0,
-                'disk_read_mb': 0.0,
-                'disk_write_mb': 0.0,
-                'monthly_cost': Decimal(str(round(monthly, 2))),
-                'resource_details': {}
-            })
-    except Exception as e:
-        logger.error(f"S3 scan error: {e}")
-    return resources
-
-
-def scan_lambda(creds, region='us-east-1'):
-    """Scan all Lambda functions."""
-    resources = []
-    try:
-        lam = get_client('lambda', creds, region)
-        funcs = lam.list_functions()
-        for fn in funcs.get('Functions', []):
-            memory = fn.get('MemorySize', 128)
-            monthly = round((memory / 1024) * 0.0000166667 * 1000000 + 0.20, 2)
-            
-            resources.append({
-                'service_category': 'Compute',
-                'service_name': 'Lambda',
-                'resource_id': fn['FunctionName'],
-                'resource_name': fn['FunctionName'],
-                'resource_type': fn.get('Runtime', 'unknown'),
-                'region': region,
-                'tags': fn.get('Tags', {}),
-                'status': 'ON',
-                'on_since': None,
-                'last_checked': datetime.now(timezone.utc),
-                'cpu_avg': 0.0,
-                'network_in_mb': 0.0,
-                'network_out_mb': 0.0,
-                'disk_read_mb': 0.0,
-                'disk_write_mb': 0.0,
-                'monthly_cost': Decimal(str(monthly)),
-                'resource_details': {
-                    'memory_mb': memory,
-                    'timeout': fn.get('Timeout'),
-                }
-            })
-    except Exception as e:
-        logger.error(f"Lambda scan error: {e}")
-    return resources
-
-
-# ============================================================
-# MAIN BREAKDOWN FUNCTION
-# ============================================================
-
-def generate_breakdown(aws_account, force_refresh=False):
+def _is_ai_scannable(r):
     """
-    Main function — scans AWS, generates AI verdicts, saves to DB.
-    If force_refresh=False and data exists, returns cached data.
+    Only send resources that actually have something to analyze:
+    - Cost > $0.50 OR
+    - Known non-ON status (stopped, unknown)
+    Everything else (free tier, zero-cost, healthy unknowns) is skipped
+    and marked MONITOR_IT automatically.
     """
-    # Check cache
+    try:
+        cost = float(r.get('monthly_cost') or 0)
+    except Exception:
+        cost = 0.0
+    if cost > 0.50:
+        return True
+    if r.get('status') in ('STOPPED', 'OFF', 'UNKNOWN'):
+        return True
+    return False
+
+
+# ============================================================
+# MAIN ENTRY — SCAN + AI + SAVE
+# ============================================================
+
+def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
+    """
+    Scan a single region for a single account.
+
+    Cache strategy:
+      - ResourceAIAnalysis rows for (account, region_scanned=region)
+      - One BreakdownSummary per (account, region_scanned)
+      - No TTL. Only force_refresh=True or explicit clear removes them.
+    """
+
+    # ---------- CACHE HIT ----------
     if not force_refresh:
-        existing = ResourceAIAnalysis.objects.filter(aws_account=aws_account)
-        if existing.exists():
-            logger.info(f"📦 Returning cached data: {existing.count()} resources")
-            return build_response(aws_account, cached=True)
-    
-    logger.info(f"🔄 Fresh scan starting for {aws_account.account_id}")
-    
-    # Delete old data
-    ResourceAIAnalysis.objects.filter(aws_account=aws_account).delete()
-    
+        existing_qs = ResourceAIAnalysis.objects.filter(
+            aws_account=aws_account,
+            region_scanned=region,
+        )
+        if existing_qs.exists():
+            logger.info(f"📦 Cache hit: {existing_qs.count()} resources in {region}")
+            return build_response(aws_account, region, cached=True)
+
+    # ---------- CACHE MISS: fresh scan ----------
+    logger.info(f"🔄 Fresh scan: {aws_account.account_id} / {region}")
+    scan_started = time.time()
+
+    # Wipe only this (account, region) slice — safer than nuking everything
+    ResourceAIAnalysis.objects.filter(
+        aws_account=aws_account, region_scanned=region,
+    ).delete()
+    BreakdownSummary.objects.filter(
+        aws_account=aws_account, region_scanned=region,
+    ).delete()
+
     # Assume role
     try:
         creds = assume_role(aws_account)
     except Exception as e:
         logger.error(f"Role assumption failed: {e}")
         return {'error': f'Failed to assume role: {e}'}
-    
-    # Scan all services
-    all_resources = []
-    all_resources.extend(scan_ec2(creds))
-    all_resources.extend(scan_rds(creds))
-    all_resources.extend(scan_s3(creds))
-    all_resources.extend(scan_lambda(creds))
-    
-    logger.info(f"📊 Scanned {len(all_resources)} total resources")
-    
-    # For each resource, get AI verdict and save
-    for r in all_resources:
-        # Build AI input
-        ai_input = {
-            'service_name': r['service_name'],
-            'service_category': r['service_category'],
-            'resource_id': r['resource_id'],
-            'resource_type': r['resource_type'],
-            'region': r['region'],
-            'status': r['status'],
-            'on_since': r['on_since'].isoformat() if r['on_since'] else 'N/A',
-            'cpu_avg': r['cpu_avg'],
-            'network_in_mb': r['network_in_mb'],
-            'network_out_mb': r['network_out_mb'],
-            'monthly_cost': float(r['monthly_cost']),
-            'tags': json.dumps(r['tags']),
-            'extra': json.dumps(r.get('resource_details', {}))
-        }
-        
-        verdict = get_ai_verdict(ai_input) or fallback_verdict(ai_input)
-        
-        # Save to DB
-        ResourceAIAnalysis.objects.update_or_create(
-            aws_account=aws_account,
-            resource_id=r['resource_id'],
-            defaults={
-                'user': aws_account.user,
-                'service_category': r['service_category'],
+
+    # Scan
+    raw_resources = scan_region(creds, region)
+    logger.info(f"📊 Discovered {len(raw_resources)} resources in {region}")
+
+    # ---------- AI VERDICTS ----------
+    ai_calls_made = 0
+    ai_calls_skipped = 0
+    saved_rows = []
+
+    for r in raw_resources:
+        if _is_ai_scannable(r):
+            ai_input = {
                 'service_name': r['service_name'],
-                'resource_name': r['resource_name'],
+                'service_category': r['service_category'],
+                'resource_id': r['resource_id'],
                 'resource_type': r['resource_type'],
                 'region': r['region'],
-                'tags': r['tags'],
                 'status': r['status'],
-                'on_since': r['on_since'],
-                'last_checked': r['last_checked'],
                 'cpu_avg': r['cpu_avg'],
-                'network_in_mb': r['network_in_mb'],
-                'network_out_mb': r['network_out_mb'],
-                'disk_read_mb': r['disk_read_mb'],
-                'disk_write_mb': r['disk_write_mb'],
-                'monthly_cost': r['monthly_cost'],
-                'ai_verdict': verdict.get('verdict', 'MONITOR_IT'),
-                'ai_short_reason': verdict.get('short_reason', ''),
-                'ai_detailed_explanation': verdict.get('detailed_explanation', ''),
-                'ai_savings_monthly': Decimal(str(verdict.get('savings_monthly', 0))),
-                'ai_savings_yearly': Decimal(str(verdict.get('savings_yearly', 0))),
-                'ai_risk': verdict.get('risk', 'LOW'),
-                'ai_steps': verdict.get('steps', []),
-                'ai_alternatives': verdict.get('alternatives', []),
-                'ai_time_to_fix': verdict.get('time_to_fix', ''),
-                'ai_one_click_available': verdict.get('one_click_available', False),
-                'ai_priority': verdict.get('priority', 5),
-                'resource_details': r.get('resource_details', {}),
+                'monthly_cost': float(r['monthly_cost']),
+                'tags': json.dumps(r['tags']),
+                'extra': json.dumps(r.get('resource_details', {})),
             }
+            verdict = get_ai_verdict(ai_input)
+            if verdict:
+                ai_calls_made += 1
+            else:
+                verdict = fallback_verdict(ai_input)
+                ai_calls_skipped += 1
+        else:
+            ai_calls_skipped += 1
+            verdict = {
+                'verdict': 'MONITOR_IT',
+                'short_reason': 'Cost is negligible — no action needed.',
+                'detailed_explanation': '',
+                'savings_monthly': 0, 'savings_yearly': 0,
+                'risk': 'ZERO', 'steps': [], 'alternatives': [],
+                'time_to_fix': 'N/A',
+                'one_click_available': False, 'priority': 1,
+            }
+
+        saved_rows.append((r, verdict))
+
+    # ---------- PERSIST ----------
+    with transaction.atomic():
+        for r, verdict in saved_rows:
+            ResourceAIAnalysis.objects.create(
+                user=aws_account.user,
+                aws_account=aws_account,
+                service_category=r['service_category'],
+                service_name=r['service_name'],
+                resource_id=r['resource_id'],
+                resource_name=r['resource_name'],
+                resource_type=r['resource_type'],
+                region=r['region'],
+                region_scanned=region,
+                tags=r['tags'],
+                status=r['status'],
+                on_since=r['on_since'],
+                last_checked=r['last_checked'],
+                cpu_avg=r['cpu_avg'],
+                network_in_mb=r['network_in_mb'],
+                network_out_mb=r['network_out_mb'],
+                disk_read_mb=r['disk_read_mb'],
+                disk_write_mb=r['disk_write_mb'],
+                monthly_cost=r['monthly_cost'],
+                ai_verdict=verdict.get('verdict', 'MONITOR_IT'),
+                ai_short_reason=verdict.get('short_reason', ''),
+                ai_detailed_explanation=verdict.get('detailed_explanation', ''),
+                ai_savings_monthly=_to_decimal(verdict.get('savings_monthly', 0)),
+                ai_savings_yearly=_to_decimal(verdict.get('savings_yearly', 0)),
+                ai_risk=verdict.get('risk', 'LOW'),
+                ai_steps=verdict.get('steps', []),
+                ai_alternatives=verdict.get('alternatives', []),
+                ai_time_to_fix=verdict.get('time_to_fix', ''),
+                ai_one_click_available=verdict.get('one_click_available', False),
+                ai_priority=verdict.get('priority', 5),
+                resource_details=r['resource_details'],
+            )
+
+    scan_duration = round(time.time() - scan_started, 1)
+
+    # ---------- AI SUMMARY ----------
+    total_cost = sum(float(r['monthly_cost']) for r, _ in saved_rows)
+    total_savings = sum(float(v.get('savings_monthly', 0)) for _, v in saved_rows)
+
+    # Build top findings for the summary prompt
+    sorted_by_savings = sorted(
+        [
+            {
+                'title': f"{r['service_name']} · {r['resource_id']}",
+                'verdict': v.get('verdict', 'MONITOR_IT'),
+                'cost': round(float(r['monthly_cost']), 2),
+                'savings': round(float(v.get('savings_monthly', 0)), 2),
+            }
+            for r, v in saved_rows
+            if v.get('savings_monthly', 0) > 0
+        ],
+        key=lambda x: x['savings'],
+        reverse=True,
+    )
+
+    summary_text = ''
+    if saved_rows:
+        summary_text = get_scan_summary(
+            region=region,
+            total_resources=len(saved_rows),
+            total_cost=round(total_cost, 2),
+            total_savings=round(total_savings, 2),
+            top_findings=sorted_by_savings,
         )
-    
-    logger.info(f"✅ Saved {len(all_resources)} resources with AI verdicts")
-    return build_response(aws_account, cached=False)
+
+    BreakdownSummary.objects.create(
+        user=aws_account.user,
+        aws_account=aws_account,
+        region_scanned=region,
+        total_resources=len(saved_rows),
+        total_services=len({r['service_name'] for r, _ in saved_rows}),
+        total_monthly_cost=_to_decimal(total_cost),
+        total_savings_monthly=_to_decimal(total_savings),
+        ai_summary=summary_text or '',
+        ai_summary_data={'top_findings': sorted_by_savings[:12]},
+        scan_duration_seconds=scan_duration,
+        ai_calls_made=ai_calls_made,
+        ai_calls_skipped=ai_calls_skipped,
+    )
+
+    logger.info(f"✅ Scan complete in {scan_duration}s — AI calls: {ai_calls_made} made, {ai_calls_skipped} skipped")
+
+    return build_response(aws_account, region, cached=False)
 
 
-def build_response(aws_account, cached=False):
-    """Format DB data into service + resource breakdown."""
-    resources = ResourceAIAnalysis.objects.filter(aws_account=aws_account)
-    
-    # Group by service
+# ============================================================
+# BUILD RESPONSE FROM DB
+# ============================================================
+
+def build_response(aws_account, region, cached=False):
+    resources = ResourceAIAnalysis.objects.filter(
+        aws_account=aws_account, region_scanned=region,
+    )
+
+    summary = BreakdownSummary.objects.filter(
+        aws_account=aws_account, region_scanned=region,
+    ).first()
+
     services_map = {}
     for r in resources:
         key = r.service_name
@@ -538,18 +585,20 @@ def build_response(aws_account, cached=False):
                 'resource_count': 0,
                 'monthly_cost': 0.0,
                 'savings': 0.0,
-                'resources': []
+                'resources': [],
             }
-        
+
         services_map[key]['resource_count'] += 1
         services_map[key]['monthly_cost'] += float(r.monthly_cost)
         services_map[key]['savings'] += float(r.ai_savings_monthly)
-        
+
         services_map[key]['resources'].append({
             'resource_id': r.resource_id,
             'resource_name': r.resource_name,
             'resource_type': r.resource_type,
             'region': r.region,
+            'service_name': r.service_name,
+            'service_category': r.service_category,
             'status': r.status,
             'on_since': r.on_since.isoformat() if r.on_since else None,
             'last_checked': r.last_checked.isoformat() if r.last_checked else None,
@@ -569,36 +618,44 @@ def build_response(aws_account, cached=False):
             'tags': r.tags,
             'resource_details': r.resource_details,
         })
-    
-    # Compute status per service
+
     for svc in services_map.values():
-        idle_count = sum(1 for r in svc['resources'] if r['ai_verdict'] in ['STOP_IT', 'TERMINATE_IT'])
-        if idle_count == svc['resource_count'] and svc['resource_count'] > 0:
+        idle = sum(1 for r in svc['resources'] if r['ai_verdict'] in ['STOP_IT', 'TERMINATE_IT'])
+        if idle == svc['resource_count'] and svc['resource_count'] > 0:
             svc['status'] = 'Idle'
-        elif idle_count > 0:
+        elif idle > 0:
             svc['status'] = 'Partially Idle'
         else:
             svc['status'] = 'Active'
         svc['monthly_cost'] = round(svc['monthly_cost'], 2)
         svc['savings'] = round(svc['savings'], 2)
-    
+
     services_list = sorted(services_map.values(), key=lambda x: x['monthly_cost'], reverse=True)
     all_resources_list = sorted(
-        [r for svc in services_list for r in svc['resources']],
-        key=lambda x: (-x['ai_priority'], -x['monthly_cost'])
+        [r for s in services_list for r in s['resources']],
+        key=lambda x: (-x['ai_priority'], -x['monthly_cost']),
     )
-    
+
     total_cost = round(sum(s['monthly_cost'] for s in services_list), 2)
     total_savings = round(sum(s['savings'] for s in services_list), 2)
-    
+
     return {
         'success': True,
         'cached': cached,
+        'region': region,
         'total_services': len(services_list),
         'total_resources': len(all_resources_list),
         'total_monthly_cost': total_cost,
         'total_savings': total_savings,
         'services': services_list,
         'resources': all_resources_list,
+        'summary': {
+            'ai_summary': summary.ai_summary if summary else '',
+            'top_findings': (summary.ai_summary_data or {}).get('top_findings', []) if summary else [],
+            'scan_duration_seconds': summary.scan_duration_seconds if summary else None,
+            'ai_calls_made': summary.ai_calls_made if summary else 0,
+            'ai_calls_skipped': summary.ai_calls_skipped if summary else 0,
+            'scanned_at': summary.scanned_at.isoformat() if summary else None,
+        },
         'last_scan': django_timezone.now().isoformat(),
     }

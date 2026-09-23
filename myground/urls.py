@@ -164,7 +164,7 @@ path( 'aws/accounts/<int:account_db_id>/resources/<path:resource_id>/action/',vi
     # ============================================================
     path('aws/accounts/<int:account_db_id>/ai-low-level-recommendations/', views.generate_low_level_ai_recommendations, name='ai_low_level_recommendations'),
     path('aws/accounts/<int:account_db_id>/ai-low-level-recommendations-cached/', views.get_low_level_ai_recommendations_cached, name='ai_low_level_recommendations_cached'),
-    
+    path('aws/regions/', views.list_aws_regions, name='aws_regions'),
     # ============================================================
     # ADMIN / MAINTENANCE
     # ============================================================

@@ -6121,61 +6121,75 @@ def clear_cache_only_simple(request):
 from .service_breakdown_service import generate_breakdown
 from .models import ResourceAIAnalysis
 
-
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def get_service_resource_breakdown(request, account_db_id):
     """
-    Main endpoint for the new Service & Resource Breakdown feature.
+    Scan / return cached Service & Resource Breakdown for one region.
     Query params:
-      - force_refresh=true → rescan AWS + regenerate AI
-      - force_refresh=false (default) → use cached data
+      - region=us-east-1   (default)
+      - force_refresh=true (bypass cache)
     """
     try:
         account = AWSAccount.objects.get(
-            id=account_db_id,
-            user=request.user,
-            status='connected'
+            id=account_db_id, user=request.user, status='connected'
         )
-        
-        force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
-        
-        result = generate_breakdown(account, force_refresh=force_refresh)
-        
-        if 'error' in result:
-            return Response({'error': result['error']}, status=500)
-        
-        return Response(result, status=200)
-        
     except AWSAccount.DoesNotExist:
         return Response({'error': 'AWS account not found'}, status=404)
+
+    region = request.query_params.get('region', 'us-east-1').strip() or 'us-east-1'
+    force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
+
+    try:
+        from .service_breakdown_service import generate_breakdown
+        result = generate_breakdown(account, region=region, force_refresh=force_refresh)
+        if 'error' in result:
+            return Response({'error': result['error']}, status=500)
+        return Response(result, status=200)
     except Exception as e:
         logger.error(f"Breakdown error: {e}")
         import traceback
         traceback.print_exc()
         return Response({'error': str(e)}, status=500)
 
-
 @api_view(['DELETE'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
 def clear_service_resource_breakdown(request, account_db_id):
-    """Clear all cached breakdown data for this account."""
+    """
+    Clear cached breakdown data for a specific region (or all regions).
+    Query param: region=us-east-1  (optional; if missing, clears ALL regions)
+    """
     try:
         account = AWSAccount.objects.get(id=account_db_id, user=request.user)
-        deleted_count, _ = ResourceAIAnalysis.objects.filter(aws_account=account).delete()
-        
-        return Response({
-            'success': True,
-            'message': f'Cleared {deleted_count} resources',
-            'deleted_count': deleted_count
-        }, status=200)
-        
     except AWSAccount.DoesNotExist:
         return Response({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        return Response({'error': str(e)}, status=500)
+
+    region = request.query_params.get('region', '').strip()
+
+    from .models import ResourceAIAnalysis, BreakdownSummary
+
+    if region:
+        r_count, _ = ResourceAIAnalysis.objects.filter(
+            aws_account=account, region_scanned=region,
+        ).delete()
+        s_count, _ = BreakdownSummary.objects.filter(
+            aws_account=account, region_scanned=region,
+        ).delete()
+        msg = f'Cleared {r_count} resources + {s_count} summary for {region}'
+    else:
+        r_count, _ = ResourceAIAnalysis.objects.filter(aws_account=account).delete()
+        s_count, _ = BreakdownSummary.objects.filter(aws_account=account).delete()
+        msg = f'Cleared {r_count} resources + {s_count} summaries across all regions'
+
+    logger.info(f"🗑️ {msg}")
+    return Response({
+        'success': True,
+        'message': msg,
+        'resources_deleted': r_count,
+        'summaries_deleted': s_count,
+    }, status=200)
 
 # myground/views.py — Add at the end of the file
 
@@ -6457,3 +6471,31 @@ def _execute_resource_fix(account, resource, user):
             'message': f'Unexpected error: {e}',
             'error': 'unexpected',
         }
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def list_aws_regions(request):
+    """Return a curated list of AWS regions the frontend can offer."""
+    regions = [
+        {'code': 'us-east-1',      'name': 'US East (N. Virginia)'},
+        {'code': 'us-east-2',      'name': 'US East (Ohio)'},
+        {'code': 'us-west-1',      'name': 'US West (N. California)'},
+        {'code': 'us-west-2',      'name': 'US West (Oregon)'},
+        {'code': 'ca-central-1',   'name': 'Canada (Central)'},
+        {'code': 'eu-west-1',      'name': 'Europe (Ireland)'},
+        {'code': 'eu-west-2',      'name': 'Europe (London)'},
+        {'code': 'eu-west-3',      'name': 'Europe (Paris)'},
+        {'code': 'eu-central-1',   'name': 'Europe (Frankfurt)'},
+        {'code': 'eu-north-1',     'name': 'Europe (Stockholm)'},
+        {'code': 'ap-south-1',     'name': 'Asia Pacific (Mumbai)'},
+        {'code': 'ap-southeast-1', 'name': 'Asia Pacific (Singapore)'},
+        {'code': 'ap-southeast-2', 'name': 'Asia Pacific (Sydney)'},
+        {'code': 'ap-northeast-1', 'name': 'Asia Pacific (Tokyo)'},
+        {'code': 'ap-northeast-2', 'name': 'Asia Pacific (Seoul)'},
+        {'code': 'sa-east-1',      'name': 'South America (São Paulo)'},
+        {'code': 'af-south-1',     'name': 'Africa (Cape Town)'},
+        {'code': 'me-south-1',     'name': 'Middle East (Bahrain)'},
+    ]
+    return Response({'regions': regions}, status=200)
