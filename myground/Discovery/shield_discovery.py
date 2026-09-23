@@ -1,9 +1,12 @@
 # discovery/shield_discovery.py
 import boto3
-from datetime import datetime
-from datetime import timezone
-# and then using:
-timezone.utc
+import urllib3
+from datetime import datetime, timezone
+from botocore.config import Config
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def discover_shield_services(creds, region):
     """Discover Shield Advanced protections and subscriptions"""
@@ -15,24 +18,24 @@ def discover_shield_services(creds, region):
             aws_access_key_id=creds['AccessKeyId'],
             aws_secret_access_key=creds['SecretAccessKey'],
             aws_session_token=creds['SessionToken'],
-            region_name='us-east-1'  # Shield is global
+            region_name='us-east-1',                     # <-- comma added here
             config=Config(
-            connect_timeout=30,
-            read_timeout=30,
-            retries={'max_attempts': 3}
-        ),
-        verify=False 
+                connect_timeout=30,
+                read_timeout=30,
+                retries={'max_attempts': 3}
+            ),
+            verify=False
         )
-        
+
         # ========== SHIELD SUBSCRIPTION ==========
         try:
             subscription = client.describe_subscription()
             if subscription:
                 sub_details = subscription.get('Subscription', {})
-                
+
                 # Shield Advanced: $3000 per month
                 monthly_cost = 3000.00
-                
+
                 services.append({
                     'service_id': 'shield_advanced',
                     'resource_id': 'shield-advanced-subscription',
@@ -50,14 +53,14 @@ def discover_shield_services(creds, region):
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-                
+
                 # ========== SHIELD ADVANCED PROTECTIONS ==========
                 protections = client.list_protections()
                 for protection in protections.get('Protections', []):
                     protection_id = protection['Id']
                     protection_name = protection['Name']
                     resource_arn = protection.get('ResourceArn')
-                    
+
                     services.append({
                         'service_id': 'shield_advanced',
                         'resource_id': protection_id,
@@ -65,7 +68,7 @@ def discover_shield_services(creds, region):
                         'region': 'global',
                         'service_type': 'Security',
                         'estimated_monthly_cost': 0.00,
-                'count': 1,  # Included in subscription
+                        'count': 1,
                         'details': {
                             'protection_id': protection_id,
                             'name': protection_name,
@@ -76,12 +79,12 @@ def discover_shield_services(creds, region):
                         },
                         'discovered_at': datetime.now(timezone.utc).isoformat()
                     })
-                
+
                 # ========== SHIELD ADVANCED EMERGENCY CONTACTS ==========
                 try:
                     emergency = client.describe_emergency_contact_settings()
                     contacts = emergency.get('EmergencyContactList', [])
-                    
+
                     services.append({
                         'service_id': 'shield_advanced',
                         'resource_id': 'shield-emergency-contacts',
@@ -89,7 +92,7 @@ def discover_shield_services(creds, region):
                         'region': 'global',
                         'service_type': 'Security',
                         'estimated_monthly_cost': 0.00,
-                'count': 1,
+                        'count': 1,
                         'details': {
                             'contacts': [
                                 {
@@ -102,9 +105,9 @@ def discover_shield_services(creds, region):
                         },
                         'discovered_at': datetime.now(timezone.utc).isoformat()
                     })
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             # Shield Standard (free)
             services.append({
                 'service_id': 'shield_standard',
@@ -121,7 +124,7 @@ def discover_shield_services(creds, region):
                 },
                 'discovered_at': datetime.now(timezone.utc).isoformat()
             })
-        
+
         # ========== DRT ACCESS ==========
         try:
             drt_access = client.describe_drt_access()
@@ -133,17 +136,17 @@ def discover_shield_services(creds, region):
                     'region': 'global',
                     'service_type': 'Security',
                     'estimated_monthly_cost': 0.00,
-                'count': 1,
+                    'count': 1,
                     'details': {
                         'role_arn': drt_access.get('RoleArn'),
                         'log_bucket_list': drt_access.get('LogBucketList', [])
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-        except:
+        except Exception:
             pass
-        
+
     except Exception as e:
         print(f"Error discovering Shield services: {str(e)}")
-    
+
     return services

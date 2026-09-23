@@ -1,17 +1,12 @@
 # discovery/cloudwatch_discovery.py
 import boto3
-from datetime import datetime, timedelta       
-from datetime import timezone
-# and then using:
-timezone.utc
-
-# Add this to the top of each discovery file (vpc_discovery.py, ec2_discovery.py, etc.)
-import boto3
 import urllib3
+from datetime import datetime, timedelta, timezone
 from botocore.config import Config
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def get_boto3_client(service, creds, region):
     """Create boto3 client with SSL verification disabled"""
@@ -26,8 +21,9 @@ def get_boto3_client(service, creds, region):
             read_timeout=30,
             retries={'max_attempts': 3}
         ),
-        verify=False  # Disable SSL verification
+        verify=False
     )
+
 
 def discover_cloudwatch_services(creds, region):
     """Discover CloudWatch resources: alarms, dashboards, logs, metrics"""
@@ -39,26 +35,26 @@ def discover_cloudwatch_services(creds, region):
             aws_access_key_id=creds['AccessKeyId'],
             aws_secret_access_key=creds['SecretAccessKey'],
             aws_session_token=creds['SessionToken'],
-            region_name=region
-              config=Config(
-            connect_timeout=30,
-            read_timeout=30,
-            retries={'max_attempts': 3}
-        ),
-        verify=False
+            region_name=region,                          # <-- comma added here
+            config=Config(
+                connect_timeout=30,
+                read_timeout=30,
+                retries={'max_attempts': 3}
+            ),
+            verify=False
         )
-        
+
         alarms = cloudwatch_client.describe_alarms()
         all_alarms = alarms.get('MetricAlarms', []) + alarms.get('CompositeAlarms', [])
-        
+
         for alarm in all_alarms:
             alarm_name = alarm['AlarmName']
             alarm_arn = alarm['AlarmArn']
             alarm_type = 'composite' if 'CompositeAlarm' in alarm else 'metric'
-            
+
             # CloudWatch alarms: $0.10 per alarm per month
             monthly_cost = 0.10
-            
+
             services.append({
                 'service_id': 'cloudwatch_alarm',
                 'resource_id': alarm_arn,
@@ -91,17 +87,16 @@ def discover_cloudwatch_services(creds, region):
                 },
                 'discovered_at': datetime.now(timezone.utc).isoformat()
             })
-        
+
         # ========== CLOUDWATCH DASHBOARDS ==========
         dashboards = cloudwatch_client.list_dashboards()
         for dashboard in dashboards.get('DashboardEntries', []):
             dashboard_name = dashboard['DashboardName']
             dashboard_arn = dashboard.get('DashboardArn')
-            
+
             # First dashboard is free, additional dashboards $3 per month
-            # Since we don't know which is first, assume cost
             monthly_cost = 3.00
-            
+
             services.append({
                 'service_id': 'cloudwatch_dashboard',
                 'resource_id': dashboard_arn if dashboard_arn else dashboard_name,
@@ -118,7 +113,7 @@ def discover_cloudwatch_services(creds, region):
                 },
                 'discovered_at': datetime.now(timezone.utc).isoformat()
             })
-        
+
         # ========== CLOUDWATCH LOGS ==========
         logs_client = boto3.client(
             'logs',
@@ -127,7 +122,7 @@ def discover_cloudwatch_services(creds, region):
             aws_session_token=creds['SessionToken'],
             region_name=region
         )
-        
+
         # Log groups
         log_groups = logs_client.describe_log_groups()
         for log_group in log_groups.get('logGroups', []):
@@ -136,18 +131,16 @@ def discover_cloudwatch_services(creds, region):
             stored_bytes = log_group.get('storedBytes', 0)
             stored_gb = stored_bytes / (1024 * 1024 * 1024)
             retention_days = log_group.get('retentionInDays', 'Never Expire')
-            
+
             # CloudWatch Logs pricing: $0.50 per GB ingested, $0.03 per GB archived
-            # Assume 1GB ingested per month for estimation
             estimated_ingested_gb = 1.0
-            storage_gb = stored_gb * 0.03  # Storage cost
-            
-            # Calculate ingestion cost
+            storage_gb = stored_gb * 0.03
+
             if retention_days == 'Never Expire' or retention_days > 0:
                 monthly_cost = (estimated_ingested_gb * 0.50) + storage_gb
             else:
                 monthly_cost = 0.00
-            
+
             services.append({
                 'service_id': 'cloudwatch_log_group',
                 'resource_id': log_group_arn if log_group_arn else log_group_name,
@@ -170,19 +163,19 @@ def discover_cloudwatch_services(creds, region):
                 },
                 'discovered_at': datetime.now(timezone.utc).isoformat()
             })
-            
+
             # ========== LOG STREAMS ==========
             try:
                 log_streams = logs_client.describe_log_streams(
                     logGroupName=log_group_name,
                     orderBy='LastEventTime',
                     descending=True,
-                    limit=5  # Only get recent streams
+                    limit=5
                 )
-                
+
                 for stream in log_streams.get('logStreams', []):
                     stream_name = stream['logStreamName']
-                    
+
                     services.append({
                         'service_id': 'cloudwatch_log_stream',
                         'resource_id': f"{log_group_arn}:{stream_name}",
@@ -190,7 +183,7 @@ def discover_cloudwatch_services(creds, region):
                         'region': region,
                         'service_type': 'Monitoring',
                         'estimated_monthly_cost': 0.00,
-                'count': 1,  # Cost included in log group
+                        'count': 1,
                         'details': {
                             'log_group_name': log_group_name,
                             'log_stream_name': stream_name,
@@ -204,9 +197,9 @@ def discover_cloudwatch_services(creds, region):
                         },
                         'discovered_at': datetime.now(timezone.utc).isoformat()
                     })
-            except:
+            except Exception:
                 pass
-            
+
             # ========== LOG METRIC FILTERS ==========
             try:
                 metric_filters = logs_client.describe_metric_filters(logGroupName=log_group_name)
@@ -218,7 +211,7 @@ def discover_cloudwatch_services(creds, region):
                         'region': region,
                         'service_type': 'Monitoring',
                         'estimated_monthly_cost': 0.00,
-                'count': 1,  # No separate charge
+                        'count': 1,
                         'details': {
                             'log_group_name': log_group_name,
                             'filter_name': filter_data.get('filterName'),
@@ -228,20 +221,19 @@ def discover_cloudwatch_services(creds, region):
                         },
                         'discovered_at': datetime.now(timezone.utc).isoformat()
                     })
-            except:
+            except Exception:
                 pass
-        
+
         # ========== CLOUDWATCH INSIGHT RULES ==========
         try:
             insight_rules = cloudwatch_client.describe_insight_rules()
             for rule in insight_rules.get('InsightRules', []):
                 rule_name = rule['Name']
                 rule_state = rule.get('State')
-                
-                # $0.20 per insight rule per hour
+
                 hourly_cost = 0.20
                 monthly_cost = hourly_cost * 730
-                
+
                 services.append({
                     'service_id': 'cloudwatch_insight_rule',
                     'resource_id': rule.get('Arn', rule_name),
@@ -249,7 +241,7 @@ def discover_cloudwatch_services(creds, region):
                     'region': region,
                     'service_type': 'Monitoring',
                     'estimated_monthly_cost': round(monthly_cost, 2),
-                'count': 1,
+                    'count': 1,
                     'details': {
                         'name': rule_name,
                         'arn': rule.get('Arn'),
@@ -259,9 +251,9 @@ def discover_cloudwatch_services(creds, region):
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-        except:
+        except Exception:
             pass
-        
+
         # ========== CLOUDWATCH SYNTHETICS ==========
         try:
             synthetics_client = boto3.client(
@@ -271,19 +263,17 @@ def discover_cloudwatch_services(creds, region):
                 aws_session_token=creds['SessionToken'],
                 region_name=region
             )
-            
+
             canaries = synthetics_client.describe_canaries()
             for canary in canaries.get('Canaries', []):
                 canary_name = canary['Name']
                 canary_arn = canary.get('Arn')
                 runtime_version = canary.get('RuntimeVersion')
                 schedule = canary.get('Schedule', {})
-                
-                # Synthetics canary pricing: $0.001 per canary run
-                # Assume hourly runs: 24 * 30 = 720 runs per month
+
                 runs_per_month = 720
                 monthly_cost = runs_per_month * 0.001
-                
+
                 services.append({
                     'service_id': 'cloudwatch_synthetics_canary',
                     'resource_id': canary_arn,
@@ -291,7 +281,7 @@ def discover_cloudwatch_services(creds, region):
                     'region': region,
                     'service_type': 'Monitoring',
                     'estimated_monthly_cost': round(monthly_cost, 2),
-                'count': 1,
+                    'count': 1,
                     'details': {
                         'name': canary_name,
                         'arn': canary_arn,
@@ -313,9 +303,9 @@ def discover_cloudwatch_services(creds, region):
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-        except:
+        except Exception:
             pass
-        
+
         # ========== CLOUDWATCH SERVICE LENS ==========
         try:
             service_lens = cloudwatch_client.list_service_lens_service_insight_visualizations()
@@ -327,7 +317,7 @@ def discover_cloudwatch_services(creds, region):
                     'region': region,
                     'service_type': 'Monitoring',
                     'estimated_monthly_cost': 0.00,
-                'count': 1,  # Included in CloudWatch
+                    'count': 1,
                     'details': {
                         'name': insight.get('Name'),
                         'arn': insight.get('Arn'),
@@ -336,16 +326,16 @@ def discover_cloudwatch_services(creds, region):
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-        except:
+        except Exception:
             pass
-        
+
         # ========== CLOUDWATCH CONTRIBUTOR INSIGHTS ==========
         try:
             contributor_rules = cloudwatch_client.describe_contributor_insights()
             for rule in contributor_rules.get('ContributorInsightRules', []):
                 rule_name = rule['Name']
                 rule_arn = rule.get('Arn')
-                
+
                 services.append({
                     'service_id': 'cloudwatch_contributor_insights',
                     'resource_id': rule_arn,
@@ -353,7 +343,7 @@ def discover_cloudwatch_services(creds, region):
                     'region': region,
                     'service_type': 'Monitoring',
                     'estimated_monthly_cost': 0.00,
-                'count': 1,  # $0.30 per million events
+                    'count': 1,
                     'details': {
                         'name': rule_name,
                         'arn': rule_arn,
@@ -363,29 +353,32 @@ def discover_cloudwatch_services(creds, region):
                     },
                     'discovered_at': datetime.now(timezone.utc).isoformat()
                 })
-        except:
+        except Exception:
             pass
-        
+
     except Exception as e:
         print(f"Error discovering CloudWatch services in {region}: {str(e)}")
-    
+
     return services
+
 
 def get_cloudwatch_alarm_tags(client, alarm_arn):
     """Get tags for CloudWatch alarm"""
     try:
         response = client.list_tags_for_resource(ResourceARN=alarm_arn)
         return response.get('Tags', [])
-    except:
+    except Exception:
         return []
+
 
 def get_log_group_tags(client, log_group_name):
     """Get tags for CloudWatch Log Group"""
     try:
         response = client.list_tags_log_group(logGroupName=log_group_name)
         return response.get('tags', {})
-    except:
+    except Exception:
         return {}
+
 
 def estimate_dashboard_widgets(client, dashboard_name):
     """Estimate number of widgets in dashboard"""
@@ -394,5 +387,5 @@ def estimate_dashboard_widgets(client, dashboard_name):
         import json
         body = json.loads(dashboard.get('DashboardBody', '{}'))
         return len(body.get('widgets', []))
-    except:
+    except Exception:
         return 0

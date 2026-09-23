@@ -1,5 +1,6 @@
 # discovery/lambda_discovery.py
 import boto3
+from botocore.config import Config
 from datetime import datetime
 
 from datetime import timezone

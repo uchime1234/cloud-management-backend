@@ -1,5 +1,6 @@
 # discovery/route53_discovery.py
 import boto3
+from botocore.config import Config
 from datetime import datetime
 from datetime import timezone
 # and then using:
@@ -14,7 +15,7 @@ def discover_route53_services(creds):
             aws_access_key_id=creds['AccessKeyId'],
             aws_secret_access_key=creds['SecretAccessKey'],
             aws_session_token=creds['SessionToken'], 
-            region_name=region,
+            region_name='us-east-1',
             config=Config(
             connect_timeout=30,
             read_timeout=30,

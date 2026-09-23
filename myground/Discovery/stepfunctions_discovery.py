@@ -1,9 +1,22 @@
 # discovery/stepfunctions_discovery.py
 import boto3
+from botocore.config import Config
 from datetime import datetime
 from datetime import timezone
 # and then using:
 timezone.utc
+
+def parse_json(s):
+    """Safely parse a JSON string. Returns dict/None."""
+    if not s:
+        return None
+    if isinstance(s, dict):
+        return s
+    try:
+        import json
+        return json.loads(s)
+    except Exception:
+        return None
 
 def discover_stepfunctions_services(creds, region):
     """Discover Step Functions state machines and activities"""
