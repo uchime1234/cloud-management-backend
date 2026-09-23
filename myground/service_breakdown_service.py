@@ -13,7 +13,7 @@ Caching:
 """
 
 import boto3
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone as dt_timezone
 from decimal import Decimal
 import requests
 import json
@@ -30,12 +30,66 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# JSON-SAFETY HELPERS
+# ============================================================
+# Discovery modules sometimes stuff raw datetime/date/Decimal objects
+# into 'on_since', 'details', 'tags'. Django's JSONField encoder can't
+# handle those, so we deep-sanitize every payload before saving.
+
+def _json_safe(value):
+    """
+    Recursively convert a value into something Django's JSONField can store.
+    Handles datetime, date, Decimal, sets, tuples, nested dicts/lists.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        # Make timezone-aware UTC then ISO
+        try:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=dt_timezone.utc)
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    # Fallback: stringify unknown types (e.g. boto3 response objects)
+    return str(value)
+
+
+def _safe_datetime(value):
+    """Return a real datetime object or None, from a datetime/str/None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt_timezone.utc)
+        return value
+    if isinstance(value, str):
+        try:
+            # Try ISO 8601
+            from datetime import datetime as _dt
+            v = value.replace('Z', '+00:00')
+            parsed = _dt.fromisoformat(v)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt_timezone.utc)
+            return parsed
+        except Exception:
+            return None
+    return None
+
+
+# ============================================================
 # DISCOVERY MODULE REGISTRY
 # ============================================================
-# All discovery modules live in myground/Discovery/
-# Each exposes a `discover_<service>_services(creds, region)` function.
-# We import lazily and tolerate missing modules so a broken one
-# doesn't break the whole scan.
 
 def _get_discovery_scanners():
     """
@@ -119,38 +173,43 @@ def _normalize_discovery_resource(raw, service_label, region):
         { 'service_id', 'resource_id', 'resource_name', 'region',
           'estimated_monthly_cost', 'count', 'details', 'service_type' }
     Convert that into the fields our model + AI prompt expect.
+    Everything that goes into JSONField is passed through _json_safe().
     """
     raw = raw or {}
     resource_id = str(raw.get('resource_id') or raw.get('service_id') or 'unknown')
     resource_name = str(raw.get('resource_name') or resource_id)
     region_value = raw.get('region') or region or 'global'
 
-    # Discovery modules call it estimated_monthly_cost; our model calls it monthly_cost
     cost_raw = raw.get('estimated_monthly_cost', 0)
-    # A few modules return hourly — guard by magnitude (very rough heuristic)
     monthly_cost = _to_decimal(cost_raw, 0)
 
     service_category = raw.get('service_type') or service_label
+
+    # Sanitize everything that will hit a JSONField or a DateTimeField
+    on_since = _safe_datetime(raw.get('on_since'))
+    last_checked = _safe_datetime(raw.get('last_checked')) or datetime.now(dt_timezone.utc)
+    safe_details = _json_safe(raw.get('details') or {})
+    safe_tags = _json_safe(raw.get('tags') if isinstance(raw.get('tags'), dict) else {})
 
     return {
         'service_category': service_category,
         'service_name': service_label,
         'resource_id': resource_id,
         'resource_name': resource_name,
-        'resource_type': raw.get('resource_type') or raw.get('service_id') or 'Unknown',
+        'resource_type': str(raw.get('resource_type') or raw.get('service_id') or 'Unknown'),
         'region': region_value,
         'region_scanned': region,
-        'tags': raw.get('tags') if isinstance(raw.get('tags'), dict) else {},
+        'tags': safe_tags,
         'status': raw.get('status') or 'ON',
-        'on_since': raw.get('on_since'),           # usually absent, that's ok
-        'last_checked': datetime.now(timezone.utc),
+        'on_since': on_since,
+        'last_checked': last_checked,
         'cpu_avg': float(raw.get('cpu_avg') or 0.0),
         'network_in_mb': float(raw.get('network_in_mb') or 0.0),
         'network_out_mb': float(raw.get('network_out_mb') or 0.0),
         'disk_read_mb': float(raw.get('disk_read_mb') or 0.0),
         'disk_write_mb': float(raw.get('disk_write_mb') or 0.0),
         'monthly_cost': monthly_cost,
-        'resource_details': raw.get('details') if isinstance(raw.get('details'), dict) else {},
+        'resource_details': safe_details,
     }
 
 
@@ -306,10 +365,7 @@ def fallback_verdict(resource_data):
 # ============================================================
 
 def get_scan_summary(region, total_resources, total_cost, total_savings, top_findings):
-    """
-    One AI call per scan that produces a plain-English summary.
-    top_findings is a list of dicts {title, verdict, cost, savings}.
-    """
+    """One AI call per scan that produces a plain-English summary."""
     try:
         findings_text = '\n'.join(
             f"- {f['title']} → {f['verdict']} (cost ${f['cost']}/mo, save ${f['savings']}/mo)"
@@ -369,11 +425,10 @@ Rules:
 
 def _is_ai_scannable(r):
     """
-    Only send resources that actually have something to analyze:
+    Only send resources that have something to analyze:
     - Cost > $0.50 OR
-    - Known non-ON status (stopped, unknown)
-    Everything else (free tier, zero-cost, healthy unknowns) is skipped
-    and marked MONITOR_IT automatically.
+    - Non-ON status (stopped/unknown)
+    Everything else is skipped and marked MONITOR_IT automatically.
     """
     try:
         cost = float(r.get('monthly_cost') or 0)
@@ -393,11 +448,7 @@ def _is_ai_scannable(r):
 def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
     """
     Scan a single region for a single account.
-
-    Cache strategy:
-      - ResourceAIAnalysis rows for (account, region_scanned=region)
-      - One BreakdownSummary per (account, region_scanned)
-      - No TTL. Only force_refresh=True or explicit clear removes them.
+    Cache per (account, region_scanned). No TTL.
     """
 
     # ---------- CACHE HIT ----------
@@ -410,11 +461,10 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
             logger.info(f"📦 Cache hit: {existing_qs.count()} resources in {region}")
             return build_response(aws_account, region, cached=True)
 
-    # ---------- CACHE MISS: fresh scan ----------
+    # ---------- CACHE MISS ----------
     logger.info(f"🔄 Fresh scan: {aws_account.account_id} / {region}")
     scan_started = time.time()
 
-    # Wipe only this (account, region) slice — safer than nuking everything
     ResourceAIAnalysis.objects.filter(
         aws_account=aws_account, region_scanned=region,
     ).delete()
@@ -422,18 +472,15 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
         aws_account=aws_account, region_scanned=region,
     ).delete()
 
-    # Assume role
     try:
         creds = assume_role(aws_account)
     except Exception as e:
         logger.error(f"Role assumption failed: {e}")
         return {'error': f'Failed to assume role: {e}'}
 
-    # Scan
     raw_resources = scan_region(creds, region)
     logger.info(f"📊 Discovered {len(raw_resources)} resources in {region}")
 
-    # ---------- AI VERDICTS ----------
     ai_calls_made = 0
     ai_calls_skipped = 0
     saved_rows = []
@@ -485,10 +532,10 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
                 resource_type=r['resource_type'],
                 region=r['region'],
                 region_scanned=region,
-                tags=r['tags'],
+                tags=_json_safe(r['tags']),
                 status=r['status'],
-                on_since=r['on_since'],
-                last_checked=r['last_checked'],
+                on_since=_safe_datetime(r['on_since']),
+                last_checked=_safe_datetime(r['last_checked']),
                 cpu_avg=r['cpu_avg'],
                 network_in_mb=r['network_in_mb'],
                 network_out_mb=r['network_out_mb'],
@@ -501,21 +548,19 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
                 ai_savings_monthly=_to_decimal(verdict.get('savings_monthly', 0)),
                 ai_savings_yearly=_to_decimal(verdict.get('savings_yearly', 0)),
                 ai_risk=verdict.get('risk', 'LOW'),
-                ai_steps=verdict.get('steps', []),
-                ai_alternatives=verdict.get('alternatives', []),
+                ai_steps=_json_safe(verdict.get('steps', [])),
+                ai_alternatives=_json_safe(verdict.get('alternatives', [])),
                 ai_time_to_fix=verdict.get('time_to_fix', ''),
                 ai_one_click_available=verdict.get('one_click_available', False),
                 ai_priority=verdict.get('priority', 5),
-                resource_details=r['resource_details'],
+                resource_details=_json_safe(r['resource_details']),
             )
 
     scan_duration = round(time.time() - scan_started, 1)
 
-    # ---------- AI SUMMARY ----------
     total_cost = sum(float(r['monthly_cost']) for r, _ in saved_rows)
     total_savings = sum(float(v.get('savings_monthly', 0)) for _, v in saved_rows)
 
-    # Build top findings for the summary prompt
     sorted_by_savings = sorted(
         [
             {
@@ -550,7 +595,7 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
         total_monthly_cost=_to_decimal(total_cost),
         total_savings_monthly=_to_decimal(total_savings),
         ai_summary=summary_text or '',
-        ai_summary_data={'top_findings': sorted_by_savings[:12]},
+        ai_summary_data=_json_safe({'top_findings': sorted_by_savings[:12]}),
         scan_duration_seconds=scan_duration,
         ai_calls_made=ai_calls_made,
         ai_calls_skipped=ai_calls_skipped,
