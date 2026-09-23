@@ -10,6 +10,7 @@ class CostForecastEngine:
         self.aws_account = aws_account
         self.historical_data = []
         self.daily_costs = []
+        self.monthly_cost = 0 
         
     def load_historical_data(self, days=90):
         """Load historical cost data from database"""

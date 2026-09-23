@@ -1443,13 +1443,14 @@ class ResourceAIAnalysis(models.Model):
     
     class Meta:
         ordering = ['-ai_priority', '-ai_savings_monthly']
-        unique_together = ('aws_account', 'resource_id')
+        unique_together = ('aws_account', 'resource_id', 'region_scanned')
         indexes = [
             models.Index(fields=['aws_account', 'service_name']),
             models.Index(fields=['aws_account', 'ai_verdict']),
             models.Index(fields=['aws_account', 'service_category']),
+            models.Index(fields=['aws_account', 'region_scanned']),
         ]
-    
+
     def __str__(self):
         return f"{self.service_name}: {self.resource_id} - {self.ai_verdict}"
 

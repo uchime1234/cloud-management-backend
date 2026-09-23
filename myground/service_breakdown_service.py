@@ -30,11 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# GROQ MODEL NAME (change here if Groq changes their lineup)
+# ============================================================
+GROQ_MODEL = 'openai/gpt-oss-120b'
+
+
+# ============================================================
 # JSON-SAFETY HELPERS
 # ============================================================
-# Discovery modules sometimes stuff raw datetime/date/Decimal objects
-# into 'on_since', 'details', 'tags'. Django's JSONField encoder can't
-# handle those, so we deep-sanitize every payload before saving.
 
 def _json_safe(value):
     """
@@ -48,7 +51,6 @@ def _json_safe(value):
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, datetime):
-        # Make timezone-aware UTC then ISO
         try:
             if value.tzinfo is None:
                 value = value.replace(tzinfo=dt_timezone.utc)
@@ -61,7 +63,6 @@ def _json_safe(value):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
-    # Fallback: stringify unknown types (e.g. boto3 response objects)
     return str(value)
 
 
@@ -75,7 +76,6 @@ def _safe_datetime(value):
         return value
     if isinstance(value, str):
         try:
-            # Try ISO 8601
             from datetime import datetime as _dt
             v = value.replace('Z', '+00:00')
             parsed = _dt.fromisoformat(v)
@@ -92,10 +92,6 @@ def _safe_datetime(value):
 # ============================================================
 
 def _get_discovery_scanners():
-    """
-    Returns a list of (service_label, callable) tuples.
-    The callable accepts (creds, region) and returns a list of resource dicts.
-    """
     scanners = []
 
     def _safe_import(module_path, func_name, label):
@@ -168,13 +164,6 @@ def _to_decimal(value, default=0):
 
 
 def _normalize_discovery_resource(raw, service_label, region):
-    """
-    Discovery modules return dicts shaped like:
-        { 'service_id', 'resource_id', 'resource_name', 'region',
-          'estimated_monthly_cost', 'count', 'details', 'service_type' }
-    Convert that into the fields our model + AI prompt expect.
-    Everything that goes into JSONField is passed through _json_safe().
-    """
     raw = raw or {}
     resource_id = str(raw.get('resource_id') or raw.get('service_id') or 'unknown')
     resource_name = str(raw.get('resource_name') or resource_id)
@@ -185,7 +174,6 @@ def _normalize_discovery_resource(raw, service_label, region):
 
     service_category = raw.get('service_type') or service_label
 
-    # Sanitize everything that will hit a JSONField or a DateTimeField
     on_since = _safe_datetime(raw.get('on_since'))
     last_checked = _safe_datetime(raw.get('last_checked')) or datetime.now(dt_timezone.utc)
     safe_details = _json_safe(raw.get('details') or {})
@@ -218,10 +206,6 @@ def _normalize_discovery_resource(raw, service_label, region):
 # ============================================================
 
 def scan_region(creds, region):
-    """
-    Runs every discovery module against a single region and returns
-    a list of normalized resource dicts.
-    """
     scanners = _get_discovery_scanners()
     all_resources = []
 
@@ -297,7 +281,7 @@ def get_ai_verdict(resource_data):
             'Content-Type': 'application/json',
         }
         payload = {
-            'model': 'llama-3.3-70b-versatile',
+            'model': GROQ_MODEL,
             'messages': [
                 {'role': 'system', 'content': 'You are a Senior AWS FinOps Expert. Respond ONLY with valid JSON.'},
                 {'role': 'user', 'content': prompt},
@@ -322,7 +306,6 @@ def get_ai_verdict(resource_data):
 
 
 def fallback_verdict(resource_data):
-    """Used when AI is skipped or fails."""
     cpu = resource_data.get('cpu_avg', 0)
     status = resource_data.get('status', 'UNKNOWN')
     cost = float(resource_data.get('monthly_cost', 0))
@@ -365,7 +348,6 @@ def fallback_verdict(resource_data):
 # ============================================================
 
 def get_scan_summary(region, total_resources, total_cost, total_savings, top_findings):
-    """One AI call per scan that produces a plain-English summary."""
     try:
         findings_text = '\n'.join(
             f"- {f['title']} → {f['verdict']} (cost ${f['cost']}/mo, save ${f['savings']}/mo)"
@@ -399,7 +381,7 @@ Rules:
             'Content-Type': 'application/json',
         }
         payload = {
-            'model': 'llama-3.3-70b-versatile',
+            'model': GROQ_MODEL,
             'messages': [
                 {'role': 'system', 'content': 'You are a Senior AWS FinOps Expert. Be specific and concise.'},
                 {'role': 'user', 'content': prompt},
@@ -424,12 +406,6 @@ Rules:
 # ============================================================
 
 def _is_ai_scannable(r):
-    """
-    Only send resources that have something to analyze:
-    - Cost > $0.50 OR
-    - Non-ON status (stopped/unknown)
-    Everything else is skipped and marked MONITOR_IT automatically.
-    """
     try:
         cost = float(r.get('monthly_cost') or 0)
     except Exception:
@@ -446,11 +422,6 @@ def _is_ai_scannable(r):
 # ============================================================
 
 def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
-    """
-    Scan a single region for a single account.
-    Cache per (account, region_scanned). No TTL.
-    """
-
     # ---------- CACHE HIT ----------
     if not force_refresh:
         existing_qs = ResourceAIAnalysis.objects.filter(
@@ -465,8 +436,12 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
     logger.info(f"🔄 Fresh scan: {aws_account.account_id} / {region}")
     scan_started = time.time()
 
+    # Wipe: this region's rows, plus any stale rows from before we added region_scanned
     ResourceAIAnalysis.objects.filter(
         aws_account=aws_account, region_scanned=region,
+    ).delete()
+    ResourceAIAnalysis.objects.filter(
+        aws_account=aws_account, region_scanned='',
     ).delete()
     BreakdownSummary.objects.filter(
         aws_account=aws_account, region_scanned=region,
@@ -519,41 +494,43 @@ def generate_breakdown(aws_account, region='us-east-1', force_refresh=False):
 
         saved_rows.append((r, verdict))
 
-    # ---------- PERSIST ----------
+    # ---------- PERSIST (update_or_create to avoid unique collisions) ----------
     with transaction.atomic():
         for r, verdict in saved_rows:
-            ResourceAIAnalysis.objects.create(
-                user=aws_account.user,
+            ResourceAIAnalysis.objects.update_or_create(
                 aws_account=aws_account,
-                service_category=r['service_category'],
-                service_name=r['service_name'],
                 resource_id=r['resource_id'],
-                resource_name=r['resource_name'],
-                resource_type=r['resource_type'],
-                region=r['region'],
                 region_scanned=region,
-                tags=_json_safe(r['tags']),
-                status=r['status'],
-                on_since=_safe_datetime(r['on_since']),
-                last_checked=_safe_datetime(r['last_checked']),
-                cpu_avg=r['cpu_avg'],
-                network_in_mb=r['network_in_mb'],
-                network_out_mb=r['network_out_mb'],
-                disk_read_mb=r['disk_read_mb'],
-                disk_write_mb=r['disk_write_mb'],
-                monthly_cost=r['monthly_cost'],
-                ai_verdict=verdict.get('verdict', 'MONITOR_IT'),
-                ai_short_reason=verdict.get('short_reason', ''),
-                ai_detailed_explanation=verdict.get('detailed_explanation', ''),
-                ai_savings_monthly=_to_decimal(verdict.get('savings_monthly', 0)),
-                ai_savings_yearly=_to_decimal(verdict.get('savings_yearly', 0)),
-                ai_risk=verdict.get('risk', 'LOW'),
-                ai_steps=_json_safe(verdict.get('steps', [])),
-                ai_alternatives=_json_safe(verdict.get('alternatives', [])),
-                ai_time_to_fix=verdict.get('time_to_fix', ''),
-                ai_one_click_available=verdict.get('one_click_available', False),
-                ai_priority=verdict.get('priority', 5),
-                resource_details=_json_safe(r['resource_details']),
+                defaults={
+                    'user': aws_account.user,
+                    'service_category': r['service_category'],
+                    'service_name': r['service_name'],
+                    'resource_name': r['resource_name'],
+                    'resource_type': r['resource_type'],
+                    'region': r['region'],
+                    'tags': _json_safe(r['tags']),
+                    'status': r['status'],
+                    'on_since': _safe_datetime(r['on_since']),
+                    'last_checked': _safe_datetime(r['last_checked']),
+                    'cpu_avg': r['cpu_avg'],
+                    'network_in_mb': r['network_in_mb'],
+                    'network_out_mb': r['network_out_mb'],
+                    'disk_read_mb': r['disk_read_mb'],
+                    'disk_write_mb': r['disk_write_mb'],
+                    'monthly_cost': r['monthly_cost'],
+                    'ai_verdict': verdict.get('verdict', 'MONITOR_IT'),
+                    'ai_short_reason': verdict.get('short_reason', ''),
+                    'ai_detailed_explanation': verdict.get('detailed_explanation', ''),
+                    'ai_savings_monthly': _to_decimal(verdict.get('savings_monthly', 0)),
+                    'ai_savings_yearly': _to_decimal(verdict.get('savings_yearly', 0)),
+                    'ai_risk': verdict.get('risk', 'LOW'),
+                    'ai_steps': _json_safe(verdict.get('steps', [])),
+                    'ai_alternatives': _json_safe(verdict.get('alternatives', [])),
+                    'ai_time_to_fix': verdict.get('time_to_fix', ''),
+                    'ai_one_click_available': verdict.get('one_click_available', False),
+                    'ai_priority': verdict.get('priority', 5),
+                    'resource_details': _json_safe(r['resource_details']),
+                },
             )
 
     scan_duration = round(time.time() - scan_started, 1)
