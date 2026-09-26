@@ -78,7 +78,6 @@ from .github_service import (
     get_user_from_token, sync_repo_deployments
 )
 from .terraform_parser import TerraformCostEstimator
-from .forecast_service import CostForecastEngine
 
 from .idle_resources import (
     check_idle_ec2_instances, check_idle_auto_scaling_groups,
@@ -3479,69 +3478,72 @@ def connect_github_repo_legacy(request):
         'message': 'Repository connected successfully'
     }, status=200)
 
-
-# Add these imports
-from .forecast_service import CostForecastEngine
-
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def get_cost_forecast(request, account_db_id):
-    """Get comprehensive cost forecasts for all timeframes"""
-    try:
-        account = AWSAccount.objects.get(id=account_db_id, user=request.user)
-        
-        # Initialize forecast engine
-        engine = CostForecastEngine(account)
-        engine.load_historical_data()
-        
-        # Get all predictions
-        forecast_data = {
-            'two_days': engine.predict_2_days(),
-            'one_week': engine.predict_1_week(),
-            'one_month': engine.predict_1_month(),
-            'two_months': engine.predict_2_months(),
-            'three_months': engine.predict_3_months(),
-            'top_growing_services': engine.get_top_growing_services(5),
-            'service_forecasts': engine.get_all_service_forecasts(),
-            'current_month_cost': engine.monthly_cost if hasattr(engine, 'monthly_cost') else 0,
-            'timestamp': timezone.now().isoformat()
-        }
-        
-        return Response(forecast_data, status=200)
-        
-    except AWSAccount.DoesNotExist:
-        return Response({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        logger.error(f"Error generating forecast: {e}")
-        return Response({'error': str(e)}, status=500)
-
+# ============================================================
+# RESOURCE FORECAST
+# ============================================================
 
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
-def get_service_forecast_detail(request, account_db_id, service_name):
-    """Get detailed forecast for a specific service"""
+def get_resource_forecast(request, account_db_id):
+    """
+    Returns the 'if nothing changes' forecast for one account + region,
+    derived from the Service & Resource Breakdown cache.
+    """
     try:
-        account = AWSAccount.objects.get(id=account_db_id, user=request.user)
-        
-        engine = CostForecastEngine(account)
-        engine.load_historical_data()
-        
-        forecast = engine.get_service_forecast(service_name)
-        
-        if not forecast:
-            return Response({'error': 'Service not found'}, status=404)
-        
-        return Response(forecast, status=200)
-        
+        account = AWSAccount.objects.get(
+            id=account_db_id, user=request.user, status='connected'
+        )
     except AWSAccount.DoesNotExist:
         return Response({'error': 'AWS account not found'}, status=404)
+
+    region = request.query_params.get('region', 'us-east-1').strip() or 'us-east-1'
+    force_refresh = request.query_params.get('force_refresh', 'false').lower() == 'true'
+
+    try:
+        from .resource_forecast_service import generate_resource_forecast
+        result = generate_resource_forecast(
+            account, region=region, force_refresh=force_refresh
+        )
+        if result.get('error') == 'no_resources':
+            return Response(result, status=200)
+        if result.get('error'):
+            return Response(result, status=500)
+        return Response(result, status=200)
     except Exception as e:
-        logger.error(f"Error getting service forecast: {e}")
+        logger.error(f"Resource forecast error: {e}")
+        import traceback
+        traceback.print_exc()
         return Response({'error': str(e)}, status=500)
 
 
+@api_view(['DELETE'])
+@authentication_classes([TokenAuthentication, SessionAuthentication])
+@permission_classes([IsAuthenticated])
+def clear_resource_forecast_view(request, account_db_id):
+    """
+    Clears the cached forecast for one account + region.
+    """
+    try:
+        account = AWSAccount.objects.get(id=account_db_id, user=request.user)
+    except AWSAccount.DoesNotExist:
+        return Response({'error': 'AWS account not found'}, status=404)
+
+    region = request.query_params.get('region', '').strip()
+    if not region:
+        return Response({'error': 'region query param required'}, status=400)
+
+    try:
+        from .resource_forecast_service import clear_resource_forecast
+        deleted = clear_resource_forecast(account, region)
+        return Response({
+            'success': True,
+            'message': f'Cleared forecast for {region}',
+            'deleted': deleted,
+        }, status=200)
+    except Exception as e:
+        logger.error(f"Clear forecast error: {e}")
+        return Response({'error': str(e)}, status=500)
 
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])

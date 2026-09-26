@@ -1494,3 +1494,48 @@ class BreakdownSummary(models.Model):
 
     def __str__(self):
         return f"{self.aws_account.account_alias} - {self.region_scanned} - {self.total_resources} resources"
+
+
+
+# ============================================================
+# RESOURCE FORECAST (one row per account + region)
+# ============================================================
+class ResourceForecast(models.Model):
+    """
+    Stores the 'if nothing changes' forecast for a single account + region,
+    derived from the current ResourceAIAnalysis rows.
+
+    Cache lives forever until the user explicitly clears it.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='resource_forecasts')
+    aws_account = models.ForeignKey(AWSAccount, on_delete=models.CASCADE, related_name='resource_forecasts')
+    region_scanned = models.CharField(max_length=50, db_index=True)
+
+    # Projections
+    tomorrow_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    next_month_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    three_month_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    # Baseline
+    total_monthly_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    resource_count = models.IntegerField(default=0)
+
+    # Top resources for the bar chart
+    top_resources = models.JSONField(default=list, blank=True)
+
+    # AI narrative
+    ai_summary = models.TextField(blank=True)
+
+    # Metadata
+    scanned_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('aws_account', 'region_scanned')
+        ordering = ['-scanned_at']
+        indexes = [
+            models.Index(fields=['aws_account', 'region_scanned']),
+        ]
+
+    def __str__(self):
+        return f"{self.aws_account.account_alias} - {self.region_scanned} - ${self.next_month_cost}/mo"

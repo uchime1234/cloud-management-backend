@@ -112,9 +112,8 @@ path( 'aws/accounts/<int:account_db_id>/resources/<path:resource_id>/action/',vi
     # ============================================================
     # COST FORECAST
     # ============================================================
-    path('aws/accounts/<int:account_db_id>/forecast/', views.get_cost_forecast, name='cost_forecast'),
-    path('aws/accounts/<int:account_db_id>/forecast/service/<str:service_name>/', views.get_service_forecast_detail, name='service_forecast_detail'),
-    
+   path('aws/accounts/<int:account_db_id>/resource-forecast/', views.get_resource_forecast, name='resource_forecast'),
+   path('aws/accounts/<int:account_db_id>/resource-forecast/clear/', views.clear_resource_forecast_view, name='resource_forecast_clear'),
    
   
     # ============================================================
