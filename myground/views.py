@@ -74,7 +74,7 @@ from .aws_cost import (
     generate_cost_analysis
 )
 from .github_service import (
-    GitHubService, exchange_code_for_token,
+    GitHubService, GitHubAPIError, exchange_code_for_token,
     get_user_from_token, sync_repo_deployments
 )
 from .terraform_parser import TerraformCostEstimator
@@ -1668,6 +1668,7 @@ def logout_user(request):
         return JsonResponse({'message': 'Logged out successfully'})
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
+
 @api_view(['POST'])
 @csrf_exempt 
 @authentication_classes([TokenAuthentication, SessionAuthentication])
@@ -1845,6 +1846,257 @@ def list_deployments(request, repo_id):
     
     return Response({'deployments': data}, status=200)
 
+@csrf_exempt
+@require_http_methods(["POST"])
+def start_github_scan_manual(request):
+    """Start GitHub scan with live progress written to cache after each repo."""
+    auth_header = request.headers.get('Authorization', '')
+    token_key = None
+    if auth_header.startswith('Token '):
+        token_key = auth_header[6:]
+
+    if not token_key:
+        return JsonResponse({'error': 'Authentication required'}, status=401)
+
+    try:
+        token_obj = Token.objects.get(key=token_key)
+        user = token_obj.user
+    except Token.DoesNotExist:
+        return JsonResponse({'error': 'Invalid or expired token'}, status=401)
+
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+        repo_ids = data.get('repo_ids', [])
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON payload'}, status=400)
+
+    if not repo_ids:
+        return JsonResponse({'error': 'No repositories selected'}, status=400)
+
+    scan_id = f"scan_{user.id}_{int(time.time())}"
+
+    def scan_repos():
+        try:
+            from .models import GitHubUser, GitHubRepo
+            from .github_service import GitHubService
+
+            # Initialize cache
+            cache.set(f"{scan_id}_status", "scanning", timeout=1800)
+            cache.set(f"{scan_id}_scanned", 0, timeout=1800)
+            cache.set(f"{scan_id}_total", len(repo_ids), timeout=1800)
+            cache.set(f"{scan_id}_percentage", 0, timeout=1800)
+            cache.set(f"{scan_id}_current", "Starting...", timeout=1800)
+            cache.set(f"{scan_id}_repos", [], timeout=1800)
+            cache.set(f"{scan_id}_terraform_count", 0, timeout=1800)
+            cache.set(f"{scan_id}_found_terraform", [], timeout=1800)
+            cache.set(f"{scan_id}_message", "Starting scan...", timeout=1800)
+
+            try:
+                github_user = GitHubUser.objects.get(user=user)
+                access_token = github_user.access_token
+            except GitHubUser.DoesNotExist:
+                cache.set(f"{scan_id}_status", "error", timeout=1800)
+                cache.set(f"{scan_id}_error", "GitHub not connected", timeout=1800)
+                cache.set(f"{scan_id}_message", "GitHub not connected", timeout=1800)
+                return
+
+            github = GitHubService(access_token)
+
+            repos_to_scan = []
+            for rid in repo_ids:
+                try:
+                    r = GitHubRepo.objects.get(id=rid, user=user)
+                    repos_to_scan.append(r)
+                except GitHubRepo.DoesNotExist:
+                    continue
+
+            total = len(repos_to_scan)
+            if total == 0:
+                cache.set(f"{scan_id}_status", "error", timeout=1800)
+                cache.set(f"{scan_id}_error", "No valid repos found", timeout=1800)
+                cache.set(f"{scan_id}_message", "No valid repos found", timeout=1800)
+                return
+
+            cache.set(f"{scan_id}_total", total, timeout=1800)
+
+            results = []
+            tf_count = 0
+            tf_repos = []
+
+            for idx, repo in enumerate(repos_to_scan, start=1):
+                owner, name = repo.repo_full_name.split('/')
+
+                cache.set(f"{scan_id}_current", repo.repo_full_name, timeout=1800)
+
+                has_tf = github.has_terraform_files(
+                    owner, name, github_user_id=github_user.github_id
+                )
+                if has_tf:
+                    tf_count += 1
+                    tf_repos.append(repo.repo_full_name)
+
+                result = {
+                    'repo_id': repo.id,
+                    'repo_name': repo.repo_full_name,
+                    'has_terraform': has_tf,
+                    'status': 'completed',
+                }
+                results.append(result)
+
+                # Write incrementally
+                cache.set(f"{scan_id}_repos", results, timeout=1800)
+                cache.set(f"{scan_id}_scanned", idx, timeout=1800)
+                cache.set(f"{scan_id}_percentage", round((idx / total) * 100, 1), timeout=1800)
+                cache.set(f"{scan_id}_terraform_count", tf_count, timeout=1800)
+                cache.set(f"{scan_id}_found_terraform", tf_repos, timeout=1800)
+                cache.set(
+                    f"{scan_id}_message",
+                    f"Scanned {idx}/{total} — {tf_count} with Terraform",
+                    timeout=1800,
+                )
+
+                time.sleep(0.15)
+
+            cache.set(f"{scan_id}_status", "complete", timeout=1800)
+            cache.set(
+                f"{scan_id}_message",
+                f"Complete! {tf_count} of {total} repos use Terraform.",
+                timeout=1800,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            cache.set(f"{scan_id}_status", "error", timeout=1800)
+            cache.set(f"{scan_id}_error", str(e), timeout=1800)
+            cache.set(f"{scan_id}_message", f"Failed: {e}", timeout=1800)
+
+    t = threading.Thread(target=scan_repos)
+    t.daemon = True
+    t.start()
+
+    return JsonResponse({
+        'success': True,
+        'scan_id': scan_id,
+        'message': 'Scan started',
+        'status_url': f'/github/scan/status/{scan_id}/',
+    }, status=200)
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def get_scan_status_manual(request, scan_id):
+    """Return partial scan results so the UI can render live progress."""
+    auth_header = request.headers.get('Authorization', '')
+    token_key = None
+    if auth_header.startswith('Token '):
+        token_key = auth_header[6:]
+
+    if not token_key:
+        return JsonResponse({'error': 'Authentication required'}, status=401)
+
+    try:
+        Token.objects.get(key=token_key)
+    except Token.DoesNotExist:
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+
+    status_val = cache.get(f"{scan_id}_status")
+    if status_val is None:
+        return JsonResponse({'error': 'Scan not found or expired'}, status=404)
+
+    response_data = {
+        'status': status_val,
+        'current_repo': cache.get(f"{scan_id}_current", ""),
+        'scanned': cache.get(f"{scan_id}_scanned", 0),
+        'total': cache.get(f"{scan_id}_total", 0),
+        'percentage': cache.get(f"{scan_id}_percentage", 0),
+        'terraform_count': cache.get(f"{scan_id}_terraform_count", 0),
+        'found_terraform': cache.get(f"{scan_id}_found_terraform", []),
+        'message': cache.get(f"{scan_id}_message", ""),
+        'results': cache.get(f"{scan_id}_repos", []),
+    }
+
+    if status_val == "error":
+        response_data['error'] = cache.get(f"{scan_id}_error", "Unknown error")
+
+    return JsonResponse(response_data, status=200)
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def github_webhook(request):
+    """Handle GitHub webhook events with HMAC verification."""
+    sig = request.headers.get('X-Hub-Signature-256', '')
+
+    from .github_service import verify_webhook_signature
+    if not verify_webhook_signature(request.body, sig):
+        logger.warning("Webhook rejected — invalid signature")
+        return JsonResponse({'error': 'Invalid signature'}, status=403)
+
+    event_type = request.headers.get('X-GitHub-Event', '')
+
+    if event_type == 'ping':
+        return JsonResponse({'message': 'pong'}, status=200)
+
+    if event_type != 'pull_request':
+        return JsonResponse({'message': 'Ignored event'}, status=200)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+    if data.get('action') != 'closed':
+        return JsonResponse({'message': 'Ignored action'}, status=200)
+
+    pr = data.get('pull_request', {})
+    if not pr.get('merged'):
+        return JsonResponse({'message': 'Not merged'}, status=200)
+
+    repo_info = data.get('repository', {})
+    repo_full_name = repo_info.get('full_name', '')
+
+    github_repo = GitHubRepo.objects.filter(
+        repo_full_name=repo_full_name, status='connected'
+    ).first()
+
+    if not github_repo:
+        return JsonResponse({'message': 'Repo not connected'}, status=200)
+
+    # Process in background so webhook returns fast
+    pr_number = pr.get('number')
+    pr_title = pr.get('title', '')
+    pr_url = pr.get('html_url', '')
+    merged_by = (pr.get('merged_by') or {}).get('login', 'unknown')
+    merged_at = pr.get('merged_at')
+
+    def _process():
+        try:
+            github = GitHubService(github_repo.access_token)
+            owner, name = repo_full_name.split('/')
+            files = github.get_pr_files(owner, name, pr_number)
+            services_affected = github.get_services_from_files(files)
+
+            DeploymentEvent.objects.update_or_create(
+                repo=github_repo,
+                pr_number=pr_number,
+                defaults={
+                    'aws_account': github_repo.aws_account,
+                    'pr_title': pr_title,
+                    'pr_url': pr_url,
+                    'merged_by': merged_by,
+                    'merged_at': merged_at,
+                    'files_changed': files[:50],
+                    'services_affected': services_affected,
+                }
+            )
+            logger.info(f"Webhook processed PR #{pr_number} in {repo_full_name}")
+        except Exception as e:
+            logger.error(f"Webhook background processing failed: {e}")
+
+    thread = threading.Thread(target=_process)
+    thread.daemon = True
+    thread.start()
+
+    return JsonResponse({'message': 'Deployment queued'}, status=200)
 
 @api_view(['POST'])
 def github_webhook(request):
@@ -1981,440 +2233,122 @@ def github_status(request):
             'connected': False
         }, status=200)
 
-
-@csrf_exempt
-@api_view(['POST'])
-@authentication_classes([TokenAuthentication])  # Only TokenAuthentication
-@permission_classes([IsAuthenticated])
-def start_github_scan(request):
-    """
-    Start scanning repositories and return scan ID for polling
-    """
-    scan_id = f"scan_{request.user.id}_{int(time.time())}"
-    
-    def scan_repos():
-        try:
-            from .models import GitHubUser
-            from .github_service import GitHubService
-            
-            # Store initial status with LONGER timeout (10 minutes)
-            cache.set(f"{scan_id}_status", "scanning", timeout=600)
-            cache.set(f"{scan_id}_message", "Starting scan...", timeout=600)
-            cache.set(f"{scan_id}_scanned", 0, timeout=600)
-            cache.set(f"{scan_id}_total", 0, timeout=600)
-            cache.set(f"{scan_id}_percentage", 0, timeout=600)
-            cache.set(f"{scan_id}_current", "Initializing...", timeout=600)
-            cache.set(f"{scan_id}_found", [], timeout=600)
-            
-            logger.info(f"Starting GitHub scan for user {request.user.id}")
-            
-            github_user = GitHubUser.objects.get(user=request.user)
-            github = GitHubService(github_user.access_token)
-            
-            repos = github.get_user_repos()
-            total_repos = len(repos) if repos else 0
-            cache.set(f"{scan_id}_total", total_repos, timeout=600)
-            
-            logger.info(f"Found {total_repos} repositories to scan")
-            
-            filtered_repos = []
-            tf_found_count = 0
-            scanned_count = 0
-            found_terraform_repos = []
-            
-            if repos:
-                for repo in repos:
-                    scanned_count += 1
-                    owner = repo.get('owner', {}).get('login')
-                    repo_name = repo.get('name')
-                    repo_full_name = repo.get('full_name')
-                    repo_id = repo.get('id')
-                    
-                    # Update progress
-                    percentage = round((scanned_count / total_repos) * 100, 1)
-                    cache.set(f"{scan_id}_current", repo_full_name, timeout=600)
-                    cache.set(f"{scan_id}_scanned", scanned_count, timeout=600)
-                    cache.set(f"{scan_id}_percentage", percentage, timeout=600)
-                    
-                    logger.info(f"Scanning [{scanned_count}/{total_repos}] {repo_full_name} ({percentage}%)")
-                    
-                    # Check cache first for Terraform detection
-                    cache_key = f"github_terraform_{repo_id}"
-                    has_tf = cache.get(cache_key)
-                    
-                    if has_tf is None:
-                        try:
-                            # Check for Terraform files
-                            has_tf = github.has_terraform_files(owner, repo_name)
-                            if has_tf:
-                                tf_found_count += 1
-                                found_terraform_repos.append(repo_full_name)
-                                logger.info(f"✅ Found Terraform in {repo_full_name}")
-                                # Update found list
-                                cache.set(f"{scan_id}_found", found_terraform_repos, timeout=600)
-                            else:
-                                logger.info(f"❌ No Terraform files in {repo_full_name}")
-                            
-                            # Cache the result
-                            cache.set(cache_key, has_tf, timeout=3600)  # 1 hour cache
-                        except Exception as e:
-                            logger.error(f"Error checking {repo_full_name}: {e}")
-                            has_tf = False
-                    else:
-                        logger.info(f"Using cached result for {repo_full_name}: {has_tf}")
-                        if has_tf:
-                            if repo_full_name not in found_terraform_repos:
-                                tf_found_count += 1
-                                found_terraform_repos.append(repo_full_name)
-                                cache.set(f"{scan_id}_found", found_terraform_repos, timeout=600)
-                    
-                    filtered_repos.append({
-                        'id': repo_id,
-                        'name': repo_name,
-                        'full_name': repo_full_name,
-                        'url': repo.get('html_url'),
-                        'private': repo.get('private', False),
-                        'has_terraform': has_tf,
-                        'updated_at': repo.get('updated_at')
-                    })
-                    
-                    # Delay to make scanning visible and avoid rate limits
-                    time.sleep(0.15)  # 150ms delay per repo
-            else:
-                logger.warning(f"No repositories found for user {request.user.id}")
-            
-            # Store results with LONGER timeout
-            cache.set(f"{scan_id}_repos", filtered_repos, timeout=600)
-            cache.set(f"{scan_id}_status", "complete", timeout=600)
-            cache.set(f"{scan_id}_terraform_count", tf_found_count, timeout=600)
-            cache.set(f"{scan_id}_found_terraform", found_terraform_repos, timeout=600)
-            cache.set(f"{scan_id}_message", f"Scan complete! Found {tf_found_count} repositories with Terraform files", timeout=600)
-            
-            logger.info(f"Scan complete for user {request.user.id}: {tf_found_count}/{total_repos} repos with Terraform")
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            logger.error(f"Scan failed for user {request.user.id}: {e}")
-            cache.set(f"{scan_id}_status", "error", timeout=600)
-            cache.set(f"{scan_id}_error", str(e), timeout=600)
-            cache.set(f"{scan_id}_message", f"Scan failed: {str(e)}", timeout=600)
-    
-    # Start background thread
-    thread = threading.Thread(target=scan_repos)
-    thread.daemon = True
-    thread.start()
-    
-    logger.info(f"Started scan with ID: {scan_id} for user {request.user.id}")
-    
-    return Response({
-        'scan_id': scan_id,
-        'message': 'Scan started',
-        'status_url': f'/github/scan/status/{scan_id}/'
-    }, status=status.HTTP_200_OK)
-
-
-
-
 @csrf_exempt
 @require_http_methods(["POST"])
-def start_github_scan_manual(request):
-    """
-    Manual version of start_github_scan that doesn't use DRF authentication
-    This bypasses all DRF authentication classes and handles token manually
-    """
-    print("=" * 60)
-    print("🔍 start_github_scan_manual called")
-    
-    # Get token from header
+def connect_github_repo_legacy(request):
+    """Legacy endpoint for GitHub repo connection (no CSRF)."""
     auth_header = request.headers.get('Authorization', '')
-    token_key = None
+    token = None
     if auth_header.startswith('Token '):
-        token_key = auth_header[6:]
-    
-    print(f"Authorization header: {auth_header[:20] if auth_header else 'None'}...")
-    print(f"Token extracted: {token_key[:10] if token_key else 'None'}...")
-    
-    if not token_key:
-        return JsonResponse({'error': 'Authentication required. Please provide a valid token.'}, status=401)
-    
-    # Validate token and get user
+        token = auth_header[6:]
+
+    if not token:
+        return JsonResponse({'error': 'Authentication required'}, status=401)
+
     try:
-        token = Token.objects.get(key=token_key)
-        user = token.user
-        print(f"✅ Authenticated user: {user.username} (ID: {user.id})")
-    except Token.DoesNotExist:
-        print("❌ Invalid token")
-        return JsonResponse({'error': 'Invalid or expired token. Please log in again.'}, status=401)
-    except Exception as e:
-        print(f"❌ Token error: {e}")
-        return JsonResponse({'error': f'Authentication error: {str(e)}'}, status=401)
-    
-    # Parse request body
+        from rest_framework.authtoken.models import Token as DRFToken
+        token_obj = DRFToken.objects.get(key=token)
+        user = token_obj.user
+    except Exception:
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+
     try:
-        import json
         data = json.loads(request.body.decode('utf-8'))
-        repo_ids = data.get('repo_ids', [])
-        print(f"Repos to scan: {repo_ids}")
     except json.JSONDecodeError as e:
-        print(f"❌ JSON decode error: {e}")
-        return JsonResponse({'error': 'Invalid JSON payload'}, status=400)
+        return JsonResponse({'error': f'Invalid JSON: {e}'}, status=400)
+
+    repo_id = data.get('repo_id')
+    repo_name = data.get('repo_name')
+    repo_full_name = data.get('repo_full_name')
+    repo_url = data.get('repo_url')
+    aws_account_id = data.get('aws_account_id')
+
+    if not repo_id or not repo_name or not repo_full_name or not aws_account_id:
+        return JsonResponse(
+            {'error': 'repo_id, repo_name, repo_full_name, aws_account_id are required'},
+            status=400,
+        )
+    if not repo_url:
+        repo_url = f"https://github.com/{repo_full_name}"
+
+    # Repo limit
+    existing = GitHubRepo.objects.filter(user=user, status='connected').count()
+    if existing >= 2:
+        return JsonResponse(
+            {'error': 'Maximum 2 repositories allowed. Disconnect one first.'},
+            status=400,
+        )
+
+    try:
+        aws_account = AWSAccount.objects.get(id=aws_account_id, user=user, status='connected')
+    except AWSAccount.DoesNotExist:
+        return JsonResponse({'error': 'AWS account not found'}, status=404)
+
+    try:
+        github_user = GitHubUser.objects.get(user=user)
+        access_token = github_user.access_token
+    except GitHubUser.DoesNotExist:
+        return JsonResponse({'error': 'GitHub not connected. Please connect GitHub first.'}, status=400)
+
+    # Validate token is still alive
+    try:
+        github_check = GitHubService(access_token)
+        authed_user = github_check.get_authenticated_user()
+        if not authed_user or 'login' not in authed_user:
+            return JsonResponse(
+                {'error': 'GitHub token is invalid or expired. Please reconnect GitHub.'},
+                status=401,
+            )
+    except GitHubAPIError as e:
+        return JsonResponse(
+            {'error': f'GitHub token validation failed: {e}'},
+            status=401,
+        )
+
+    if GitHubRepo.objects.filter(user=user, repo_id=repo_id).exists():
+        return JsonResponse({'error': 'Repository already connected'}, status=400)
+
+    # Create webhook
+    webhook_id = None
+    try:
+        github = GitHubService(access_token)
+        owner, repo = repo_full_name.split('/')
+        base_url = getattr(settings, 'BASE_URL', 'https://cloud-management-backend.onrender.com').rstrip('/')
+        webhook_url = f"{base_url}/api/github/webhook/"
+        webhook = github.create_webhook(owner, repo, webhook_url)
+        webhook_id = webhook.get('id') if webhook else None
     except Exception as e:
-        print(f"❌ Error parsing request: {e}")
-        return JsonResponse({'error': 'Invalid request body'}, status=400)
-    
-    if not repo_ids:
-        return JsonResponse({'error': 'No repositories selected. Please select at least one repository to scan.'}, status=400)
-    
-    # Generate unique scan ID
-    scan_id = f"scan_{user.id}_{int(time.time())}"
-    print(f"Generated scan ID: {scan_id}")
-    
-    def scan_repos():
-        """Background thread function to scan repositories"""
-        try:
-            from .models import GitHubUser, GitHubRepo
-            from .github_service import GitHubService
-            
-            # Store initial status with LONGER timeout (10 minutes)
-            cache.set(f"{scan_id}_status", "scanning", timeout=600)
-            cache.set(f"{scan_id}_message", "Starting scan...", timeout=600)
-            cache.set(f"{scan_id}_scanned", 0, timeout=600)
-            cache.set(f"{scan_id}_total", 0, timeout=600)
-            cache.set(f"{scan_id}_percentage", 0, timeout=600)
-            cache.set(f"{scan_id}_current", "Initializing...", timeout=600)
-            cache.set(f"{scan_id}_found", [], timeout=600)
-            
-            logger.info(f"Starting GitHub scan for user {user.id}")
-            
-            # Get GitHub user's access token
+        logger.warning(f"Webhook creation failed: {e}")
+
+    try:
+        with transaction.atomic():
+            github_repo = GitHubRepo.objects.create(
+                user=user,
+                aws_account=aws_account,
+                repo_id=int(repo_id),
+                repo_name=str(repo_name),
+                repo_full_name=str(repo_full_name),
+                repo_url=str(repo_url),
+                access_token=access_token,
+                webhook_id=webhook_id,
+                status='connected',
+                last_sync_at=timezone.now(),
+            )
             try:
-                github_user = GitHubUser.objects.get(user=user)
-                access_token = github_user.access_token
-                print(f"✅ Got GitHub token for user: {github_user.github_username}")
-            except GitHubUser.DoesNotExist:
-                print("❌ GitHubUser not found")
-                cache.set(f"{scan_id}_status", "error", timeout=600)
-                cache.set(f"{scan_id}_error", "GitHub not connected. Please connect GitHub first.", timeout=600)
-                cache.set(f"{scan_id}_message", "GitHub not connected. Please connect GitHub first.", timeout=600)
-                return
-            
-            github = GitHubService(access_token)
-            
-            # Get repositories to scan
-            repos_to_scan = []
-            for repo_id in repo_ids:
-                try:
-                    repo = GitHubRepo.objects.get(id=repo_id, user=user)
-                    repos_to_scan.append(repo)
-                except GitHubRepo.DoesNotExist:
-                    print(f"⚠️ Repo {repo_id} not found for user")
-            
-            total_repos = len(repos_to_scan)
-            cache.set(f"{scan_id}_total", total_repos, timeout=600)
-            
-            logger.info(f"Found {total_repos} repositories to scan")
-            
-            scan_results = []
-            tf_found_count = 0
-            scanned_count = 0
-            found_terraform_repos = []
-            
-            for repo in repos_to_scan:
-                scanned_count += 1
-                repo_full_name = repo.repo_full_name
-                repo_id = repo.repo_id
-                
-                # Update progress
-                percentage = round((scanned_count / total_repos) * 100, 1) if total_repos > 0 else 0
-                cache.set(f"{scan_id}_current", repo_full_name, timeout=600)
-                cache.set(f"{scan_id}_scanned", scanned_count, timeout=600)
-                cache.set(f"{scan_id}_percentage", percentage, timeout=600)
-                
-                logger.info(f"Scanning [{scanned_count}/{total_repos}] {repo_full_name} ({percentage}%)")
-                
-                # Check cache first for Terraform detection
-                cache_key = f"github_terraform_{repo_id}"
-                has_tf = cache.get(cache_key)
-                
-                if has_tf is None:
-                    try:
-                        owner, repo_name = repo_full_name.split('/')
-                        # Check for Terraform files
-                        has_tf = github.has_terraform_files(owner, repo_name)
-                        if has_tf:
-                            tf_found_count += 1
-                            found_terraform_repos.append(repo_full_name)
-                            logger.info(f"✅ Found Terraform in {repo_full_name}")
-                            cache.set(f"{scan_id}_found", found_terraform_repos, timeout=600)
-                        else:
-                            logger.info(f"❌ No Terraform files in {repo_full_name}")
-                        
-                        # Cache the result
-                        cache.set(cache_key, has_tf, timeout=3600)  # 1 hour cache
-                    except Exception as e:
-                        logger.error(f"Error checking {repo_full_name}: {e}")
-                        has_tf = False
-                else:
-                    logger.info(f"Using cached result for {repo_full_name}: {has_tf}")
-                    if has_tf:
-                        if repo_full_name not in found_terraform_repos:
-                            tf_found_count += 1
-                            found_terraform_repos.append(repo_full_name)
-                            cache.set(f"{scan_id}_found", found_terraform_repos, timeout=600)
-                
-                scan_results.append({
-                    'repo_id': repo.id,
-                    'repo_name': repo_full_name,
-                    'has_terraform': has_tf,
-                    'status': 'completed'
-                })
-                
-                # Small delay to avoid rate limits
-                time.sleep(0.15)
-            
-            # Store results
-            cache.set(f"{scan_id}_repos", scan_results, timeout=600)
-            cache.set(f"{scan_id}_status", "complete", timeout=600)
-            cache.set(f"{scan_id}_terraform_count", tf_found_count, timeout=600)
-            cache.set(f"{scan_id}_found_terraform", found_terraform_repos, timeout=600)
-            cache.set(f"{scan_id}_message", f"Scan complete! Found {tf_found_count} repositories with Terraform files", timeout=600)
-            cache.set(f"{scan_id}_results", scan_results, timeout=600)
-            
-            logger.info(f"Scan complete for user {user.id}: {tf_found_count}/{total_repos} repos with Terraform")
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            logger.error(f"Scan failed for user {user.id}: {e}")
-            cache.set(f"{scan_id}_status", "error", timeout=600)
-            cache.set(f"{scan_id}_error", str(e), timeout=600)
-            cache.set(f"{scan_id}_message", f"Scan failed: {str(e)}", timeout=600)
-    
-    # Start background thread
-    thread = threading.Thread(target=scan_repos)
-    thread.daemon = True
-    thread.start()
-    
-    logger.info(f"Started scan with ID: {scan_id} for user {user.username}")
-    
+                sync_repo_deployments(github_repo.id)
+            except Exception as e:
+                logger.warning(f"Initial sync failed: {e}")
+    except Exception as e:
+        logger.error(f"DB error: {e}")
+        return JsonResponse({'error': f'Database error: {e}'}, status=500)
+
     return JsonResponse({
         'success': True,
-        'scan_id': scan_id,
-        'message': 'Scan started successfully',
-        'status_url': f'/github/scan/status/{scan_id}/'
+        'repo_id': github_repo.id,
+        'message': 'Repository connected successfully',
     }, status=200)
 
 
-@csrf_exempt
-@require_http_methods(["GET"])
-def get_scan_status_manual(request, scan_id):
-    """
-    Manual version of get_scan_status that doesn't use DRF authentication
-    """
-    print(f"🔍 get_scan_status_manual called for scan_id: {scan_id}")
-    
-    # Get token from header
-    auth_header = request.headers.get('Authorization', '')
-    token_key = None
-    if auth_header.startswith('Token '):
-        token_key = auth_header[6:]
-    
-    if not token_key:
-        return JsonResponse({'error': 'Authentication required'}, status=401)
-    
-    # Validate token and get user
-    try:
-        token = Token.objects.get(key=token_key)
-        user = token.user
-        print(f"✅ Authenticated user: {user.username}")
-    except Token.DoesNotExist:
-        return JsonResponse({'error': 'Invalid token'}, status=401)
-    
-    # Get scan status from cache
-    status_val = cache.get(f"{scan_id}_status")
-    
-    if status_val is None:
-        print(f"❌ Scan not found: {scan_id}")
-        return JsonResponse({'error': 'Scan not found or expired'}, status=404)
-    
-    # Get all progress data
-    scanned = cache.get(f"{scan_id}_scanned", 0)
-    total = cache.get(f"{scan_id}_total", 0)
-    percentage = cache.get(f"{scan_id}_percentage", 0)
-    current_repo = cache.get(f"{scan_id}_current", "")
-    found_terraform = cache.get(f"{scan_id}_found", [])
-    terraform_count = cache.get(f"{scan_id}_terraform_count", 0)
-    message = cache.get(f"{scan_id}_message", "")
-    
-    response_data = {
-        'status': status_val,
-        'current_repo': current_repo,
-        'scanned': scanned,
-        'total': total,
-        'percentage': percentage,
-        'found_terraform': found_terraform,
-        'terraform_count': terraform_count,
-        'message': message,
-    }
-    
-    if status_val == "complete":
-        results = cache.get(f"{scan_id}_results", [])
-        repos = cache.get(f"{scan_id}_repos", [])
-        response_data['results'] = results or repos
-        response_data['found_terraform_repos'] = cache.get(f"{scan_id}_found_terraform", [])
-        print(f"✅ Returning complete scan results: {len(response_data['results'])} repos, {terraform_count} with Terraform")
-    
-    if status_val == "error":
-        response_data['error'] = cache.get(f"{scan_id}_error", "Unknown error")
-        print(f"❌ Returning error for scan {scan_id}: {response_data['error']}")
-    
-    return JsonResponse(response_data, status=200)
-
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication, SessionAuthentication])
-@permission_classes([IsAuthenticated])
-def get_scan_status(request, scan_id):
-    """
-    Poll for scan progress
-    """
-    status_val = cache.get(f"{scan_id}_status")
-    
-    if status_val is None:
-        logger.warning(f"Scan not found: {scan_id}")
-        return Response({'error': 'Scan not found or expired'}, status=status.HTTP_404_NOT_FOUND)
-    
-    # Get all progress data
-    scanned = cache.get(f"{scan_id}_scanned", 0)
-    total = cache.get(f"{scan_id}_total", 0)
-    percentage = cache.get(f"{scan_id}_percentage", 0)
-    current_repo = cache.get(f"{scan_id}_current", "")
-    found_terraform = cache.get(f"{scan_id}_found", [])
-    terraform_count = cache.get(f"{scan_id}_terraform_count", 0)
-    message = cache.get(f"{scan_id}_message", "")
-    
-    response_data = {
-        'status': status_val,
-        'current_repo': current_repo,
-        'scanned': scanned,
-        'total': total,
-        'percentage': percentage,
-        'found_terraform': found_terraform,
-        'terraform_count': terraform_count,
-        'message': message,
-    }
-    
-    if status_val == "complete":
-        repos = cache.get(f"{scan_id}_repos", [])
-        response_data['repos'] = repos
-        response_data['found_terraform_repos'] = cache.get(f"{scan_id}_found_terraform", [])
-        logger.info(f"Returning complete scan results: {len(repos)} repos, {terraform_count} with Terraform")
-    
-    if status_val == "error":
-        response_data['error'] = cache.get(f"{scan_id}_error", "Unknown error")
-        logger.error(f"Returning error for scan {scan_id}: {response_data['error']}")
-    
-    return Response(response_data, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
@@ -2988,78 +2922,6 @@ def list_connected_repos(request):
     
     return Response({'repos': data}, status=status.HTTP_200_OK)
 
-@login_required
-def connect_github_repo(request):
-    """Connect a GitHub repository"""
-    try:
-        data = json.loads(request.body)
-        repo_id = data.get('repo_id')
-        repo_name = data.get('repo_name')
-        repo_full_name = data.get('repo_full_name')
-        repo_url = data.get('repo_url')
-        access_token = data.get('access_token')
-        installation_id = data.get('installation_id')
-        aws_account_id = data.get('aws_account_id')
-        
-        if not all([repo_id, repo_name, repo_full_name, repo_url, access_token]):
-            return JsonResponse({'error': 'Missing required fields'}, status=400)
-        
-        # Get AWS account if provided
-        aws_account = None
-        if aws_account_id:
-            try:
-                aws_account = AWSAccount.objects.get(id=aws_account_id, user=request.user)
-            except AWSAccount.DoesNotExist:
-                pass
-        
-        # Create or update repo
-        repo, created = GitHubRepo.objects.update_or_create(
-            user=request.user,
-            repo_id=repo_id,
-            defaults={
-                'repo_name': repo_name,
-                'repo_full_name': repo_full_name,
-                'repo_url': repo_url,
-                'access_token': access_token,
-                'installation_id': installation_id,
-                'aws_account': aws_account,
-                'status': 'connected'
-            }
-        )
-        
-        # Create webhook
-        if aws_account:
-            webhook_url = f"{settings.SITE_URL}/api/github/webhook/"
-            github_service = GitHubService(access_token)
-            webhook = github_service.create_webhook(
-                repo_full_name.split('/')[0],
-                repo_full_name.split('/')[1],
-                webhook_url
-            )
-            if webhook and webhook.get('id'):
-                repo.webhook_id = webhook['id']
-                repo.save()
-        
-        return JsonResponse({
-            'message': 'Repository connected successfully',
-            'repo': {
-                'id': repo.id,
-                'repo_id': repo.repo_id,
-                'repo_name': repo.repo_name,
-                'repo_full_name': repo.repo_full_name,
-                'repo_url': repo.repo_url,
-                'aws_account_id': repo.aws_account.id if repo.aws_account else None,
-                'status': repo.status,
-                'webhook_id': repo.webhook_id
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error connecting GitHub repo: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
-
-
-
 @api_view(['DELETE'])
 @authentication_classes([TokenAuthentication, SessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -3126,72 +2988,6 @@ def list_deployments(request, repo_id):
         return JsonResponse({'error': 'Repository not found'}, status=404)
     except Exception as e:
         logger.error(f"Error listing deployments: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
-
-@csrf_exempt
-def github_webhook(request):
-    """Handle GitHub webhook events"""
-    try:
-        event_type = request.headers.get('X-GitHub-Event', '')
-        
-        if event_type != 'pull_request':
-            return JsonResponse({'message': 'Ignored event'}, status=200)
-        
-        data = json.loads(request.body)
-        action = data.get('action', '')
-        
-        if action != 'closed':
-            return JsonResponse({'message': 'Ignored action'}, status=200)
-        
-        pull_request = data.get('pull_request', {})
-        if not pull_request.get('merged', False):
-            return JsonResponse({'message': 'PR not merged'}, status=200)
-        
-        repo = data.get('repository', {})
-        repo_full_name = repo.get('full_name', '')
-        
-        # Find connected repo in database
-        github_repo = GitHubRepo.objects.filter(
-            repo_full_name=repo_full_name,
-            status='connected'
-        ).first()
-        
-        if not github_repo:
-            return JsonResponse({'message': 'Repo not connected'}, status=200)
-        
-        # Get PR files
-        github_service = GitHubService(github_repo.access_token)
-        pr_number = pull_request.get('number')
-        files = github_service.get_pr_files(
-            repo_full_name.split('/')[0],
-            repo_full_name.split('/')[1],
-            pr_number
-        )
-        
-        # Determine affected services
-        services_affected = github_service.get_services_from_files(files)
-        
-        # Create deployment event
-        deployment = DeploymentEvent.objects.create(
-            repo=github_repo,
-            aws_account=github_repo.aws_account,
-            pr_number=pr_number,
-            pr_title=pull_request.get('title', ''),
-            pr_url=pull_request.get('html_url', ''),
-            merged_by=pull_request.get('merged_by', {}).get('login', 'unknown'),
-            merged_at=timezone.datetime.fromisoformat(
-                pull_request.get('merged_at', '').replace('Z', '+00:00')
-            ),
-            files_changed=[f.get('filename', '') for f in files[:50]],
-            services_affected=services_affected
-        )
-        
-        logger.info(f"Created deployment event: {deployment}")
-        
-        return JsonResponse({'message': 'Deployment recorded'}, status=200)
-        
-    except Exception as e:
-        logger.error(f"Error in GitHub webhook: {e}")
         return JsonResponse({'error': str(e)}, status=500)
 
 @login_required
@@ -3297,186 +3093,6 @@ def test_terraform_detection(request, owner, repo):
     except Exception as e:
         logger.error(f"Error testing terraform detection: {e}")
         return JsonResponse({'error': str(e)}, status=500)
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def connect_github_repo_legacy(request):
-    """
-    Legacy endpoint for GitHub repo connection (no CSRF)
-    """
-    print("🔍 connect_github_repo_legacy called")
-    print(f"Request method: {request.method}")
-    print(f"Request body: {request.body}")
-    
-    # Get token from header
-    auth_header = request.headers.get('Authorization', '')
-    token = None
-    if auth_header.startswith('Token '):
-        token = auth_header[6:]
-    
-    print(f"Auth header: {auth_header[:20] if auth_header else 'None'}...")
-    print(f"Token extracted: {token[:10] if token else 'None'}...")
-    
-    if not token:
-        return JsonResponse({'error': 'Authentication required'}, status=401)
-    
-    try:
-        from rest_framework.authtoken.models import Token
-        token_obj = Token.objects.get(key=token)
-        user = token_obj.user
-        print(f"✅ Authenticated user: {user.username} (ID: {user.id})")
-    except Token.DoesNotExist:
-        print("❌ Invalid token")
-        return JsonResponse({'error': 'Invalid token'}, status=401)
-    except Exception as e:
-        print(f"❌ Token error: {e}")
-        return JsonResponse({'error': f'Token error: {str(e)}'}, status=401)
-    
-    # Parse request body
-    try:
-        data = json.loads(request.body.decode('utf-8'))
-        print(f"✅ Parsed data: {data}")
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON decode error: {e}")
-        return JsonResponse({'error': f'Invalid JSON: {str(e)}'}, status=400)
-    
-    # Extract fields with proper validation
-    repo_id = data.get('repo_id')
-    repo_name = data.get('repo_name')
-    repo_full_name = data.get('repo_full_name')
-    repo_url = data.get('repo_url')
-    aws_account_id = data.get('aws_account_id')
-    
-    print(f"repo_id: {repo_id} (type: {type(repo_id)})")
-    print(f"repo_name: {repo_name}")
-    print(f"repo_full_name: {repo_full_name}")
-    print(f"repo_url: {repo_url}")
-    print(f"aws_account_id: {aws_account_id}")
-    
-    # Validate required fields
-    if not repo_id:
-        return JsonResponse({'error': 'repo_id is required'}, status=400)
-    if not repo_name:
-        return JsonResponse({'error': 'repo_name is required'}, status=400)
-    if not repo_full_name:
-        return JsonResponse({'error': 'repo_full_name is required'}, status=400)
-    if not aws_account_id:
-        return JsonResponse({'error': 'aws_account_id is required'}, status=400)
-    
-    # If repo_url is missing, construct it from repo_full_name
-    if not repo_url:
-        repo_url = f"https://github.com/{repo_full_name}"
-        print(f"Constructed repo_url: {repo_url}")
-    
-    # Import models inside function to avoid circular imports
-    try:
-        from .models import GitHubRepo, GitHubUser, AWSAccount
-        print("✅ Models imported successfully")
-    except Exception as e:
-        print(f"❌ Failed to import models: {e}")
-        return JsonResponse({'error': f'Model import error: {str(e)}'}, status=500)
-    
-    # Check user's repo limit (max 2)
-    try:
-        existing_repos = GitHubRepo.objects.filter(user=user, status='connected').count()
-        print(f"Existing connected repos: {existing_repos}")
-        if existing_repos >= 2:
-            return JsonResponse({'error': 'Maximum 2 repositories allowed. Please disconnect one first.'}, status=400)
-    except Exception as e:
-        print(f"❌ Error checking repo limit: {e}")
-        return JsonResponse({'error': f'Error checking repo limit: {str(e)}'}, status=500)
-    
-    # Get AWS account
-    try:
-        aws_account = AWSAccount.objects.get(id=aws_account_id, user=user, status='connected')
-        print(f"✅ Found AWS account: {aws_account.account_alias}")
-    except AWSAccount.DoesNotExist:
-        print(f"❌ AWS account not found: {aws_account_id}")
-        return JsonResponse({'error': 'AWS account not found'}, status=404)
-    except Exception as e:
-        print(f"❌ Error fetching AWS account: {e}")
-        return JsonResponse({'error': f'Error fetching AWS account: {str(e)}'}, status=500)
-    
-    # Get token from GitHubUser model
-    try:
-        github_user = GitHubUser.objects.get(user=user)
-        access_token = github_user.access_token
-        print(f"✅ Got GitHub token for user: {github_user.github_username}")
-    except GitHubUser.DoesNotExist:
-        print("❌ GitHubUser not found - user hasn't connected GitHub")
-        return JsonResponse({'error': 'GitHub not connected. Please connect GitHub first.'}, status=400)
-    except Exception as e:
-        print(f"❌ Error fetching GitHub user: {e}")
-        return JsonResponse({'error': f'Error fetching GitHub user: {str(e)}'}, status=500)
-    
-    # Check if repo already connected
-    try:
-        if GitHubRepo.objects.filter(user=user, repo_id=repo_id).exists():
-            return JsonResponse({'error': 'Repository already connected'}, status=400)
-    except Exception as e:
-        print(f"❌ Error checking existing repo: {e}")
-        return JsonResponse({'error': f'Error checking existing repo: {str(e)}'}, status=500)
-    
-    # Create webhook (optional, continue even if webhook fails)
-    webhook_id = None
-    try:
-        from .github_service import GitHubService
-        github = GitHubService(access_token)
-        owner, repo = repo_full_name.split('/')
-        webhook_url = f"{settings.BASE_URL}/api/github/webhook/"
-        
-        print(f"📡 Creating webhook for {owner}/{repo} at {webhook_url}")
-        
-        webhook = github.create_webhook(owner, repo, webhook_url)
-        webhook_id = webhook.get('id') if webhook else None
-        print(f"✅ Webhook created with ID: {webhook_id}")
-    except Exception as e:
-        print(f"⚠️ Failed to create webhook: {e}")
-        # Continue without webhook
-    
-    # Save to database
-    from django.db import transaction
-    from django.utils import timezone
-    
-    try:
-        with transaction.atomic():
-            print("Creating GitHubRepo record...")
-            github_repo = GitHubRepo(
-                user=user,
-                aws_account=aws_account,
-                repo_id=int(repo_id),  # Ensure it's an integer
-                repo_name=str(repo_name),
-                repo_full_name=str(repo_full_name),
-                repo_url=str(repo_url),
-                access_token=access_token,
-                webhook_id=webhook_id,
-                status='connected',
-                last_sync_at=timezone.now()
-            )
-            print(f"Repo object created: {github_repo}")
-            
-            github_repo.save()
-            print(f"✅ Saved GitHubRepo with ID: {github_repo.id}")
-            
-            # Initial sync (optional, don't fail if it doesn't work)
-            try:
-                from .github_service import sync_repo_deployments
-                sync_repo_deployments(github_repo.id)
-                print("✅ Initial sync completed")
-            except Exception as e:
-                print(f"⚠️ Initial sync failed: {e}")
-                # Don't fail the whole request
-    except Exception as e:
-        print(f"❌ Error saving to database: {e}")
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'error': f'Database error: {str(e)}'}, status=500)
-    
-    return JsonResponse({
-        'success': True,
-        'repo_id': github_repo.id,
-        'message': 'Repository connected successfully'
-    }, status=200)
 
 # ============================================================
 # RESOURCE FORECAST
