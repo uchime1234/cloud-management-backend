@@ -16,7 +16,6 @@ from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
-# Try to import certifi
 try:
     import certifi
     HAS_CERTIFI = True
@@ -74,17 +73,13 @@ class GitHubService:
                 if response.status_code == 404:
                     return None
 
-                if response.status_code == 200 or response.status_code == 201:
+                if response.status_code in (200, 201):
                     return response.json() if response.content else None
 
                 if response.status_code == 403:
-                    # Rate limit — wait and retry
                     if self.rate_limit_remaining == 0 and self.rate_limit_reset:
-                        wait = max(
-                            0,
-                            self.rate_limit_reset - int(time.time())
-                        )
-                        if wait > 0 and wait < 60:
+                        wait = max(0, self.rate_limit_reset - int(time.time()))
+                        if 0 < wait < 60:
                             logger.warning(f"Rate limited. Waiting {wait}s.")
                             time.sleep(wait)
                             continue
@@ -93,7 +88,6 @@ class GitHubService:
                         raise GitHubAPIError(f"403: {response.text[:200]}")
                     return None
 
-                # Other 4xx/5xx
                 if raise_on_error:
                     raise GitHubAPIError(
                         f"{response.status_code}: {response.text[:200]}"
@@ -125,32 +119,54 @@ class GitHubService:
 
     def get_authenticated_user(self):
         """Return the authenticated user (used for token validation)."""
-        return self._make_request('GET', 'https://api.github.com/user', raise_on_error=True)
+        return self._make_request(
+            'GET', 'https://api.github.com/user', raise_on_error=True
+        )
 
-    def get_user_repos(self, page=1, per_page=100):
+    def get_user_repos(self):
+        """
+        Fetch ALL repos the user has access to:
+          - owned repos
+          - collaborator repos
+          - organization-member repos
+          - public, private, and internal visibility
+        Paginated, deduped.
+        """
         all_repos = []
-        current_page = page
-        max_pages = 10  # raise from 5
+        current_page = 1
+        per_page = 100
+        max_pages = 20   # up to 2000 repos
 
         while current_page <= max_pages:
             url = (
                 f"https://api.github.com/user/repos"
                 f"?page={current_page}&per_page={per_page}"
                 f"&sort=updated&direction=desc"
+                f"&visibility=all"
+                f"&affiliation=owner,collaborator,organization_member"
             )
             result = self._make_request('GET', url)
-            if result is None:
-                break
-            if isinstance(result, list):
-                all_repos.extend(result)
-                if len(result) < per_page:
-                    break
-                current_page += 1
-            else:
+            if not isinstance(result, list):
                 break
 
-        logger.info(f"Fetched {len(all_repos)} repos")
-        return all_repos
+            all_repos.extend(result)
+            logger.info(f"Page {current_page}: got {len(result)} repos")
+
+            if len(result) < per_page:
+                break
+            current_page += 1
+
+        # Dedupe by full_name (pagination can double-return)
+        seen = set()
+        unique = []
+        for r in all_repos:
+            key = r.get('full_name')
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(r)
+
+        logger.info(f"Fetched {len(unique)} unique repos (raw: {len(all_repos)})")
+        return unique
 
     def get_repo_details(self, owner, repo):
         url = f"https://api.github.com/repos/{owner}/{repo}"
@@ -178,18 +194,13 @@ class GitHubService:
     # ============================================================
 
     def has_terraform_files(self, owner, repo, github_user_id=None, max_depth=2):
-        """
-        Check if a repo contains .tf files.
-        Cache key includes the user id to avoid cross-user collisions.
-        Does NOT use the GitHub Search API (rate-limit landmine).
-        """
+        """Check if a repo contains .tf files. Cache key includes user id."""
         cache_key = f"github_terraform_{github_user_id}_{owner}_{repo}"
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
         try:
-            # Root
             contents = self.get_repo_contents(owner, repo, max_depth=1)
             if isinstance(contents, list):
                 for item in contents:
@@ -211,7 +222,6 @@ class GitHubService:
                                     cache.set(cache_key, True, timeout=86400)
                                     return True
 
-            # Common paths
             for path in ['terraform/', 'tf/', 'infrastructure/', 'iac/',
                          'infra/', 'provisioning/', 'modules/']:
                 contents = self.get_repo_contents(
@@ -254,12 +264,9 @@ class GitHubService:
         return result if result else []
 
     def get_services_from_files(self, files_changed):
-        """
-        Determine AWS services affected — parses both filename AND patch content.
-        """
+        """Determine AWS services affected — parses filename AND patch content."""
         services = set()
 
-        # Filename → service mapping (fallback)
         name_patterns = {
             'EC2': ['ec2', 'instance', 'ami', 'key-pair', 'security-group'],
             'S3': ['s3', 'bucket'],
@@ -275,7 +282,6 @@ class GitHubService:
             'EKS': ['eks', 'node-group'],
         }
 
-        # Content patterns (from the patch/diff)
         content_patterns = {
             'EC2': ['aws_instance', 'aws_launch_template', 'aws_ami', 'aws_key_pair'],
             'S3': ['aws_s3_bucket', 'aws_s3_object'],
@@ -302,12 +308,10 @@ class GitHubService:
             path = (f.get('filename') or '').lower()
             patch = (f.get('patch') or '').lower()
 
-            # Filename match
             for service, patterns in name_patterns.items():
                 if any(p in path for p in patterns):
                     services.add(service)
 
-            # Content match (more reliable for Terraform)
             for service, patterns in content_patterns.items():
                 if any(p in patch for p in patterns):
                     services.add(service)

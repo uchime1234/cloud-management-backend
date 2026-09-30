@@ -1495,7 +1495,48 @@ class BreakdownSummary(models.Model):
     def __str__(self):
         return f"{self.aws_account.account_alias} - {self.region_scanned} - {self.total_resources} resources"
 
+# ============================================================
+# IDLE SCAN ERRORS — track permission / API failures
+# ============================================================
+class IdleScanError(models.Model):
+    """
+    Records any AWS API failure that prevented a detector from running.
+    Persists forever so users can see "we've never been able to scan SQS".
+    Frontend surfaces these as "missing permissions" so users can fix them.
+    """
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='idle_scan_errors'
+    )
+    aws_account = models.ForeignKey(
+        AWSAccount, on_delete=models.CASCADE, related_name='idle_scan_errors'
+    )
 
+    detector = models.CharField(max_length=50, db_index=True)     # 'ec2', 'nat_gateway', 's3'
+    error_code = models.CharField(max_length=80, blank=True)      # 'AccessDenied'
+    error_message = models.TextField(blank=True)
+
+    # The AWS permission that's missing, e.g. 'ec2:DescribeNatGateways'
+    missing_permission = models.CharField(max_length=200, blank=True)
+
+    # Full IAM snippet the user can paste into their role
+    required_iam_action = models.TextField(blank=True)
+
+    # Whether user has marked this as acknowledged (e.g. "we know, we don't want that scope")
+    is_acknowledged = models.BooleanField(default=False)
+
+    detected_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-detected_at']
+        unique_together = ('aws_account', 'detector', 'missing_permission')
+        indexes = [
+            models.Index(fields=['aws_account', 'detector']),
+            models.Index(fields=['aws_account', 'is_acknowledged']),
+        ]
+
+    def __str__(self):
+        return f"{self.aws_account.account_alias} - {self.detector} - {self.error_code}"
 
 # ============================================================
 # RESOURCE FORECAST (one row per account + region)
