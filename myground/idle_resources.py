@@ -216,6 +216,7 @@ def check_idle_ec2_instances(role_arn=None, external_id=None, region='us-east-1'
                 Statistics=['Average'],
             )
             points = cpu_response.get('Datapoints', [])
+            logger.info(f"EC2 {instance_id}: CloudWatch returned {len(points)} CPU datapoints")
             if points:
                 avg_cpu = sum(p['Average'] for p in points) / len(points)
                 cpu_data_available = True

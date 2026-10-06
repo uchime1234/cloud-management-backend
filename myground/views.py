@@ -3981,7 +3981,7 @@ def scan_all_idle_resources_advanced(request, account_id):
 
     # ---------- CACHE ----------
     try:
-        _save_idle_scan_to_db(request.user, account, payload)
+        _save_idle_scan_to_db(request.user, account, payload) 
     except Exception as e:
         logger.error(f"Failed to save idle scan snapshot: {e}")
 
